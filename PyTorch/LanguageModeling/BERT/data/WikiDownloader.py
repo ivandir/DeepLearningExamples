@@ -1,4 +1,4 @@
-# Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2019-2021 NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,6 +16,7 @@ import os
 import urllib.request
 import subprocess
 import sys
+import subprocess
 
 class WikiDownloader:
     def __init__(self, language, save_path):
@@ -25,6 +26,7 @@ class WikiDownloader:
             os.makedirs(self.save_path)
 
         self.language = language
+        # Use a mirror from https://dumps.wikimedia.org/mirrors.html if the below links do not work
         self.download_urls = {
             'en' : 'https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2',
             'zh' : 'https://dumps.wikimedia.org/zhwiki/latest/zhwiki-latest-pages-articles.xml.bz2'
@@ -45,9 +47,11 @@ class WikiDownloader:
             if os.path.isfile(self.save_path + '/' + filename):
                 print('** Download file already exists, skipping download')
             else:
-                response = urllib.request.urlopen(url)
-                with open(self.save_path + '/' + filename, "wb") as handle:
-                    handle.write(response.read())
+                cmd = ['wget', url, '--output-document={}'.format(self.save_path + '/' + filename)]
+                print('Running:', cmd)
+                status = subprocess.run(cmd)
+                if status.returncode != 0:
+                    raise RuntimeError('Wiki download not successful')
 
             # Always unzipping since this is relatively fast and will overwrite
             print('Unzipping:', self.output_files[self.language])

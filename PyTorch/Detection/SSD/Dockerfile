@@ -1,22 +1,14 @@
-FROM nvcr.io/nvidia/pytorch:19.08-py3
+ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:22.10-py3
+FROM ${FROM_IMAGE_NAME}
 
 # Set working directory
-WORKDIR /workspace
+WORKDIR /workspace/ssd
 
-ENV PYTHONPATH "${PYTHONPATH}:/workspace"
-
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-tk python-pip git tmux htop tree
-
-# Necessary pip packages
-RUN pip install --upgrade pip
-
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-RUN python3 -m pip install pycocotools==2.0.0
-
-# Copy SSD code
-COPY ./setup.py .
-COPY ./csrc ./csrc
-RUN pip install .
-
+# Copy the model files
 COPY . .
+
+# Install python requirements
+RUN pip install --no-cache-dir -r requirements.txt
+
+ENV CUDNN_V8_API_ENABLED=1
+ENV TORCH_CUDNN_V8_API_ENABLED=1

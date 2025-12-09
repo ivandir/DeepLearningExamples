@@ -1,6 +1,6 @@
-# Kaldi ASR Integration With TensorRT Inference Server
+# Kaldi ASR Integration With Triton
 
-This repository provides a Kaldi ASR custom backend for the NVIDIA TensorRT Inference Server (TRTIS). It can be used to demonstrate high-performance online inference on Kaldi ASR models. This includes handling the gRPC communication between the TensorRT Inference Server and clients, and the dynamic batching of inference requests. This repository is tested and maintained by NVIDIA.
+This repository provides a Kaldi ASR custom backend for the NVIDIA Triton (former TensorRT Inference Server). It can be used to demonstrate high-performance online inference on Kaldi ASR models. This includes handling the gRPC communication between the Triton and clients, and the dynamic batching of inference requests. This repository is tested and maintained by NVIDIA.
 
 ## Table Of Contents
 
@@ -33,9 +33,9 @@ This repository provides a Kaldi ASR custom backend for the NVIDIA TensorRT Infe
 
 This repository provides a wrapper around the online GPU-accelerated ASR pipeline from the paper [GPU-Accelerated Viterbi Exact Lattice Decoder for Batched Online and Offline Speech Recognition](https://arxiv.org/abs/1910.10032). That work includes a high-performance implementation of a GPU HMM Decoder, a low-latency Neural Net driver, fast Feature Extraction for preprocessing, and new ASR pipelines tailored for GPUs. These different modules have been integrated into the Kaldi ASR framework.
 
-This repository contains a TensorRT Inference Server custom backend for the Kaldi ASR framework. This custom backend calls the high-performance online GPU pipeline from the Kaldi ASR framework. This TensorRT Inference Server integration provides ease-of-use to Kaldi ASR inference: gRPC streaming server, dynamic sequence batching, and multi-instances support. A client connects to the gRPC server, streams audio by sending chunks to the server, and gets back the inferred text as an answer (see [Input/Output](#input-output)). More information about the TensorRT Inference Server can be found [here](https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-guide/docs/).  
+This repository contains a Triton custom backend for the Kaldi ASR framework. This custom backend calls the high-performance online GPU pipeline from the Kaldi ASR framework. This Triton integration provides ease-of-use to Kaldi ASR inference: gRPC streaming server, dynamic sequence batching, and multi-instances support. A client connects to the gRPC server, streams audio by sending chunks to the server, and gets back the inferred text as an answer (see [Input/Output](#input-output)). More information about the Triton can be found [here](https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-guide/docs/).  
 
-This TensorRT Inference Server integration is meant to be used with the LibriSpeech model for demonstration purposes. We include a pre-trained version of this model to allow you to easily test this work (see [Quick Start Guide](#quick-start-guide)). Both the TensorRT Inference Server integration and the underlying Kaldi ASR online GPU pipeline are a work in progress and will support more functionalities in the future. This includes online iVectors not currently supported in the Kaldi ASR GPU online pipeline and being replaced by a zero vector (see [Known issues](#known-issues)). Support for a custom Kaldi model is experimental (see [Using a custom Kaldi model](#using-custom-kaldi-model)).
+This Triton integration is meant to be used with the LibriSpeech model for demonstration purposes. We include a pre-trained version of this model to allow you to easily test this work (see [Quick Start Guide](#quick-start-guide)). Both the Triton integration and the underlying Kaldi ASR online GPU pipeline are a work in progress and will support more functionalities in the future. Support for a custom Kaldi model is experimental (see [Using a custom Kaldi model](#using-custom-kaldi-model)).
 
 ### Reference model
 
@@ -46,21 +46,24 @@ A reference model is used by all test scripts and benchmarks presented in this r
 Details about parameters can be found in the [Parameters](#parameters) section.
 
 * `model path`: Configured to use the pretrained LibriSpeech model.
+* `use_tensor_cores`: 1
+* `main_q_capacity`: 30000
+* `aux_q_capacity`: 400000
 * `beam`: 10
+* `num_channels`: 4000
 * `lattice_beam`: 7
 * `max_active`: 10,000
 * `frame_subsampling_factor`: 3
 * `acoustic_scale`: 1.0
-* `num_worker_threads`: 20
-* `max_execution_batch_size`: 256
-* `max_batch_size`: 4096
-* `instance_group.count`: 2
+* `num_worker_threads`: 40
+* `max_batch_size`: 400
+* `instance_group.count`: 1
 
 ## Setup
 
 ### Requirements 
 
-This repository contains Dockerfiles which extends the Kaldi and TensorRT Inference Server NVIDIA GPU Cloud (NGC) containers and encapsulates some dependencies. Aside from these dependencies, ensure you have [NVIDIA Docker](https://github.com/NVIDIA/nvidia-docker) installed.
+This repository contains Dockerfiles which extends the Kaldi and Triton NVIDIA GPU Cloud (NGC) containers and encapsulates some dependencies. Aside from these dependencies, ensure you have [NVIDIA Docker](https://github.com/NVIDIA/nvidia-docker) installed.
 
 
 For more information about how to get started with NGC containers, see the following sections from the NVIDIA GPU Cloud Documentation and the Deep Learning Documentation:
@@ -108,7 +111,7 @@ The following command will stream 1000 parallel streams to the server. The `-p` 
 
 ### Parameters
 
-The configuration is done through the `config.pbtxt` file available in `model-repo/` directory. It allows you to specify the following:
+The configuration is done through the `config.pbtxt` file available in the `model-repo/kaldi_online/` directory. It allows you to specify the following:
 
 ####  Model path
 
@@ -134,14 +137,13 @@ The model configuration parameters are passed to the model and have  an impact o
 
 The inference engine configuration parameters configure the inference engine. They impact performance, but not accuracy.
 
-* `max_batch_size`: The maximum number of inference channels opened at a given time. If set to `4096`, then one instance will handle at most 4096 concurrent users.
+* `max_batch_size`: The size of one execution batch on the GPU. This parameter should be set as large as necessary to saturate the GPU, but not bigger. Larger batches will lead to a higher throughput, smaller batches to lower latency.
 * `num_worker_threads`: The number of CPU threads for the postprocessing CPU tasks, such as lattice determinization and text generation from the lattice.
-* `max_execution_batch_size`: The size of one execution batch on the GPU. This parameter should be set as large as necessary to saturate the GPU, but not bigger. Larger batches will lead to a higher throughput, smaller batches to lower latency. 
 * `input.WAV_DATA.dims`: The maximum number of samples per chunk. The value must be a multiple of `frame_subsampling_factor * chunks_per_frame`.
 
 ### Inference process
 
-Inference is done through simulating concurrent users. Each user is attributed to one utterance from the LibriSpeech dataset. It streams that utterance by cutting it into chunks and gets the final `TEXT` output once the final chunk has been sent. A parameter sets the number of active users being simulated in parallel.  
+Inference is done through simulating concurrent users. Each user is attributed to one utterance from the LibriSpeech dataset. It streams that utterance by cutting it into chunks and gets the final `TEXT` output once the final chunk has been sent. The `-c` parameter sets the number of active users being simulated in parallel.  
 
 ### Client command-line parameters
 
@@ -156,7 +158,7 @@ The client can be configured through a set of parameters that define its behavio
     -u <URL for inference service and its gRPC port>
     -o : Only feed each channel at realtime speed. Simulates online clients.
     -p : Print text outputs
-
+    -b : Print partial (best path) text outputs
 ```
 
 ### Input/Output
@@ -187,8 +189,6 @@ Even if only the best path is used, we are still generating a full lattice for b
 
 Support for Kaldi ASR models that are different from the provided LibriSpeech model is experimental. However, it is possible to modify the [Model Path](#model-path) section of the config file `model-repo/kaldi_online/config.pbtxt` to set up your own model. 
 
-The models and Kaldi allocators are currently not shared between instances. This means that if your model is large, you may end up with not enough memory on the GPU to store two different instances. If that's the case, you can set `count` to `1` in the `instance_group` section of the config file.
-
 ## Performance
 
 
@@ -204,8 +204,7 @@ Latency is defined as the delay between the availability of the last chunk of au
 4. *Server:* Compute inference of last chunk
 5. *Server:* Generate the raw lattice for the full utterance
 6. *Server:* Determinize the raw lattice
-7. *Server:* Generate the text output associated with the best path in the determinized lattice
-8. *Client:* Receive text output
+8. *Client:* Receive lattice output
 9. *Client:* Call callback with output
 10. ***t1** <- Current time*  
 
@@ -216,19 +215,18 @@ The latency is defined such as `latency = t1 - t0`.
 Our results were obtained by:
 
 1. Building and starting the server as described in [Quick Start Guide](#quick-start-guide).
-2. Running  `scripts/run_inference_all_v100.sh` and  `scripts/run_inference_all_t4.sh`
+2. Running  `scripts/run_inference_all_a100.sh`,  `scripts/run_inference_all_v100.sh` and `scripts/run_inference_all_t4.sh`
 
-| GPU | Realtime I/O | Number of parallel audio channels | Throughput (RTFX) | Latency | | | |
-| ------ | ------ | ------ | ------ | ------ | ------ | ------ |------ |
-| | | | | 90% | 95% | 99% | Avg |
-| V100 | No | 2000 | 1769.8 | N/A | N/A | N/A | N/A |
-| V100 | Yes | 1500 |  1220 | 0.424 | 0.473 | 0.758 | 0.345 |
-| V100 | Yes | 1000 |  867.4 | 0.358 | 0.405 | 0.707 | 0.276 |
-| V100 | Yes | 800 |  647.8 | 0.304 | 0.325 | 0.517 | 0.238 |
-| T4 | No | 1000 | 906.7 | N/A | N/A | N/A| N/A |
-| T4 | Yes | 700 | 629.6 | 0.629 | 0.782 | 1.01 | 0.463 |
-| T4 | Yes | 400 | 373.7 | 0.417 | 0.441 | 0.690 | 0.349 |
 
+|  GPU  | Realtime I/O | Number of parallel audio channels | Latency (s) |       |       |       |
+| ----- | ------------ | --------------------------------- | ----------- | ----- | ----- | ----- |
+|       |              |                                   |     90%     |  95%  |  99%  |  Avg  |
+|  A100 |          Yes |                              2000 |       0.11 | 0.12 | 0.14 | 0.09 |
+|  V100 |          Yes |                              2000 |       0.42 | 0.50 | 0.61 | 0.23 |
+|  V100 |          Yes |                              1000 |       0.09 | 0.09 | 0.11 | 0.07 |
+|  T4   |          Yes |                              600  |       0.17 | 0.18 | 0.22 | 0.14 |
+|  T4   |          Yes |                              400  |       0.12 | 0.13 | 0.15 | 0.10 |
+  
 ## Release notes
 
 ### Changelog
@@ -236,6 +234,13 @@ Our results were obtained by:
 January 2020
 * Initial release
 
-### Known issues
+April 2020
+* Printing WER accuracy in Triton client
+* Using the latest Kaldi GPU ASR pipeline, extended support for features (ivectors, fbanks)
 
-Only mfcc features are supported at this time. The reference model used in the benchmark scripts requires both mfcc and iVector features to deliver the best accuracy. Support for iVector features will be added in a future release.
+July 2021
+* Significantly improve latency and throughput for the backend
+* Update Triton to v2.10.0
+
+### Known issues
+* No multi-gpu support for the Triton integration

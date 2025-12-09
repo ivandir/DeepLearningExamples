@@ -1,5 +1,5 @@
 # Copyright (c) 2017 Elad Hoffer
-# Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -26,6 +26,7 @@ import sys
 import time
 from contextlib import contextmanager
 
+import dllogger
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -131,10 +132,13 @@ def setup_seeds(master_seed, epochs, device):
 
 def barrier():
     """
-    Call torch.distributed.barrier() if distritubed is in use
+    Call torch.distributed.barrier() if distritubed is in use, else calls
+    torch.cuda.synchronize() if CUDA is initialized.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
+    elif torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.synchronize()
 
 
 def get_rank():
@@ -206,6 +210,10 @@ def setup_logging(log_all_ranks=True, log_file=os.devnull):
     rank = get_rank()
     rank_filter = RankFilter(rank, log_all_ranks)
 
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+        handler.close()
+
     logging_format = "%(asctime)s - %(levelname)s - %(rank)s - %(message)s"
     logging.basicConfig(level=logging.DEBUG,
                         format=logging_format,
@@ -218,6 +226,28 @@ def setup_logging(log_all_ranks=True, log_file=os.devnull):
     console.setFormatter(formatter)
     logging.getLogger('').addHandler(console)
     logging.getLogger('').addFilter(rank_filter)
+
+
+def setup_dllogger(enabled=True, filename=os.devnull):
+    rank = get_rank()
+
+    if enabled and rank == 0:
+        backends = [
+            dllogger.JSONStreamBackend(
+                dllogger.Verbosity.VERBOSE,
+                filename,
+                ),
+            ]
+        dllogger.init(backends)
+    else:
+        dllogger.init([])
+
+    dllogger.metadata("test_bleu", {"unit": None})
+    dllogger.metadata("eval_90%_latency", {"unit": "ms"})
+    dllogger.metadata("eval_avg_latency", {"unit": "ms"})
+    dllogger.metadata("train_elapsed", {"unit": "s"})
+    dllogger.metadata("eval_throughput", {"unit": "tokens/s"})
+    dllogger.metadata("train_throughput", {"unit": "tokens/s"})
 
 
 def set_device(cuda, local_rank):
@@ -262,7 +292,7 @@ def log_env_info():
 
 
 def pad_vocabulary(math):
-    if math == 'fp16' or math == 'manual_fp16':
+    if math == 'tf32' or math == 'fp16' or math == 'manual_fp16':
         pad_vocab = 8
     elif math == 'fp32':
         pad_vocab = 1

@@ -10,6 +10,7 @@ This repository provides a script and recipe to train the SSD300 v1.1 model to a
         * [Features](#features)
     * [Mixed precision training](#mixed-precision-training)
         * [Enabling mixed precision](#enabling-mixed-precision)
+        * [Enabling TF32](#enabling-tf32)
 - [Setup](#setup)
     * [Requirements](#requirements)
 - [Quick Start Guide](#quick-start-guide)
@@ -22,6 +23,7 @@ This repository provides a script and recipe to train the SSD300 v1.1 model to a
             * [Data preprocessing](#data-preprocessing)
             * [Data augmentation](#data-augmentation)
     * [Training process](#training-process)
+    * [Evaluation process](#evaluation-process)
     * [Inference process](#inference-process)
 - [Performance](#performance)
     * [Benchmarking](#benchmarking)
@@ -29,11 +31,16 @@ This repository provides a script and recipe to train the SSD300 v1.1 model to a
         * [Inference performance benchmark](#inference-performance-benchmark)
     * [Results](#results)
         * [Training accuracy results](#training-accuracy-results)
-            * [NVIDIA DGX-1 (8x V100 16G)](#nvidia-dgx-1-8x-v100-16g)
+            * [Training accuracy: NVIDIA DGX A100 (8x A100 80GB)](#training-accuracy-nvidia-dgx-a100-8x-a100-80gb)
+            * [Training accuracy: NVIDIA DGX-1 (8x V100 16GB)](#training-accuracy-nvidia-dgx-1-8x-v100-16gb)
+            * [Training loss plot](#training-loss-plot)
+            * [Training stability test](#training-stability-test)
         * [Training performance results](#training-performance-results)
-            * [NVIDIA DGX-1 (8x V100 16G)](#nvidia-dgx-1-8x-v100-16g-1)
+            * [Training performance: NVIDIA DGX A100 (8x A100 80GB)](#training-performance-nvidia-dgx-a100-8x-a100-80gb)
+            * [Training performance: NVIDIA DGX-1 (8x V100 16G)](#training-performance-nvidia-dgx-1-8x-v100-16gb)
         * [Inference performance results](#inference-performance-results)
-            * [NVIDIA DGX-1 (1x V100 16G)](#nvidia-dgx-1-1x-v100-16g)
+            * [Inference performance: NVIDIA DGX A100 (1x A100 80GB)](#inference-performance-nvidia-dgx-a100-1x-a100-80gb)
+            * [Inference performance: NVIDIA DGX-1 (1x V100 16GB)](#inference-performance-nvidia-dgx-1-1x-v100-16gb)
 - [Release notes](#release-notes)
     * [Changelog](#changelog)
     * [Known issues](#known-issues)
@@ -67,9 +74,9 @@ To fully utilize GPUs during training we are using the
 [NVIDIA DALI](https://github.com/NVIDIA/DALI) library
 to accelerate data preparation pipelines.
 
-This model is trained with mixed precision using Tensor Cores on NVIDIA
-Volta and Turing GPUs. Therefore, researchers can get results 2x faster
-than training without Tensor Cores, while experiencing the benefits of
+This model is trained with mixed precision using Tensor Cores on Volta, Turing,
+and the NVIDIA Ampere GPU architectures. Therefore, researchers can get results
+2x faster than training without Tensor Cores, while experiencing the benefits of
 mixed precision training. This model is tested against each NGC monthly
 container release to ensure consistent accuracy and performance over time.
 
@@ -112,27 +119,23 @@ by the number of GPUs and multiplied by the batch size divided by 32).
 
 The following features are supported by this model.
 
-| Feature               | SSD300 v1.1 PyTorch             |
-|-----------------------|--------------------------
-|Multi-GPU training with [Distributed Data Parallel (DDP)](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)  |  Yes |
-|[NVIDIA DALI](https://docs.nvidia.com/deeplearning/sdk/dali-release-notes/index.html)                |  Yes |
-
+| **Feature** | **SSD300 v1.1 PyTorch** |
+|:---------:|:----------:|
+|[AMP](https://pytorch.org/docs/stable/amp.html)                                        |  Yes |
+|[APEX DDP](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)               |  Yes |
+|[NVIDIA DALI](https://docs.nvidia.com/deeplearning/sdk/dali-release-notes/index.html)  |  Yes |
 
 #### Features
 
-Multi-GPU training with Distributed Data Parallel - Our model uses Apex's
-DDP to implement efficient multi-GPU training with NCCL.
-To enable multi-GPU training with DDP, you have to wrap your model
-with a proper class, and change the way you launch training.
-For details, see example sources in this repo or see
-the [PyTorch tutorial](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html).
+[AMP](https://pytorch.org/docs/stable/amp.html) is an abbreviation used for automatic mixed precision training.
 
-NVIDIA DALI - DALI is a library accelerating data preparation pipeline.
+[DDP](https://nvidia.github.io/apex/parallel.html) stands for DistributedDataParallel and is used for multi-GPU training.
+
+[NVIDIA DALI](https://docs.nvidia.com/deeplearning/sdk/dali-release-notes/index.html) - DALI is a library accelerating data preparation pipeline.
 To accelerate your input pipeline, you only need to define your data loader
 with the DALI library.
 For details, see example sources in this repo or see
 the [DALI documentation](https://docs.nvidia.com/deeplearning/sdk/dali-developer-guide/docs/index.html)
-
 
 ### Mixed precision training
 
@@ -142,7 +145,7 @@ training offers significant computational speedup by performing operations
 in half-precision format, while storing minimal information in single-precision
 to retain as much information as possible in critical parts of the network.
 Since the introduction of [Tensor Cores](https://developer.nvidia.com/tensor-cores)
-in the Volta and Turing architecture, significant training speedups are
+in Volta, and following with both the Turing and Ampere architectures, significant training speedups are
 experienced by switching to mixed precision -- up to 3x overall speedup
 on the most arithmetically intense model architectures. Using mixed precision
 training requires two steps:
@@ -160,58 +163,31 @@ documentation.
 -   Techniques used for mixed precision training, see the [Mixed-Precision
 Training of Deep Neural Networks](https://devblogs.nvidia.com/mixed-precision-training-deep-neural-networks/)
 blog.
--   How to access and enable AMP for TensorFlow, see [Using TF-AMP](https://docs.nvidia.com/deeplearning/dgx/tensorflow-user-guide/index.html#tfamp)
-from the TensorFlow User Guide.
--   APEX tools for mixed precision training, see the [NVIDIA Apex: Tools
-for Easy Mixed-Precision Training in PyTorch](https://devblogs.nvidia.com/apex-pytorch-easy-mixed-precision-training/).
+-   PyTorch AMP, see the [PyTorch Automatic Mixed Precision package](https://pytorch.org/docs/stable/amp.html).
 
 
 #### Enabling mixed precision
 
 Mixed precision is enabled in PyTorch by using the Automatic Mixed Precision (AMP)
-library from [APEX](https://github.com/NVIDIA/apex) which casts variables
+autocast [torch.cuda.amp.autocast](https://pytorch.org/docs/stable/amp.html#autocasting) which casts variables
 to half-precision upon retrieval, while storing variables in single-precision format.
 Furthermore, to preserve small gradient magnitudes in backpropagation,
-a [loss scaling](https://docs.nvidia.com/deeplearning/sdk/mixed-precision-training/index.html#lossscaling)
-step must be included when applying gradients. In PyTorch, loss scaling
-can be easily applied by using `scale_loss()` method provided by AMP.
-The scaling value to be used can be [dynamic](https://nvidia.github.io/apex/fp16_utils.html#apex.fp16_utils.DynamicLossScaler)
-or fixed.
+a [gradient scaling](https://pytorch.org/docs/stable/amp.html#gradient-scaling)
+step must be included.
 
 For an in-depth walk through on AMP, check out sample usage
-[here](https://github.com/NVIDIA/apex/tree/master/apex/amp#usage-and-getting-started).
-[APEX](https://github.com/NVIDIA/apex) is a PyTorch extension that contains
-utility libraries, such as AMP, which require minimal network code changes
-to leverage Tensor Cores performance.
+[here](https://pytorch.org/docs/stable/amp.html).
 
-To enable mixed precision, you can:
-- Import AMP from APEX:
 
-  ```
-  from apex import amp
-  ```
-- Initialize an AMP handle:
+#### Enabling TF32
 
-  ```
-  amp_handle = amp.init(enabled=True, verbose=True)
-  ```
-- Wrap your optimizer with the AMP handle:
+TensorFloat-32 (TF32) is the new math mode in [NVIDIA A100](https://www.nvidia.com/en-us/data-center/a100/) GPUs for handling the matrix math also called tensor operations. TF32 running on Tensor Cores in A100 GPUs can provide up to 10x speedups compared to single-precision floating-point math (FP32) on Volta GPUs.
 
-  ```
-  optimizer = amp_handle.wrap_optimizer(optimizer)
-  ```
-- Scale loss before backpropagation (assuming loss is stored in a variable called `losses`)
-  - Default backpropagate for FP32:
+TF32 Tensor Cores can speed up networks using FP32, typically with no loss of accuracy. It is more robust than FP16 for models which require high dynamic range for weights or activations.
 
-    ```
-    losses.backward()
-    ```
-  - Scale loss and backpropagate with AMP:
+For more information, refer to the [TensorFloat-32 in the A100 GPU Accelerates AI Training, HPC up to 20x](https://blogs.nvidia.com/blog/2020/05/14/tensorfloat-32-precision-format/) blog post.
 
-    ```
-    with optimizer.scale_loss(losses) as scaled_losses:
-       scaled_losses.backward()
-    ```
+TF32 is supported in the NVIDIA Ampere GPU architecture and is enabled by default.
 
 ### Glossary
 
@@ -242,12 +218,15 @@ The following section lists the requirements in order to start training the SSD3
 
 
 ### Requirements
-This repository contains `Dockerfile` which extends the PyTorch 19.08 NGC container
+This repository contains `Dockerfile` which extends the PyTorch 22.10 NGC container
 and encapsulates some dependencies.  Aside from these dependencies,
 ensure you have the following software:
 * [NVIDIA Docker](https://github.com/NVIDIA/nvidia-docker)
-* [PyTorch 19.08-py3+ NGC container](https://ngc.nvidia.com/registry/nvidia-pytorch)
-* [NVIDIA Volta](https://www.nvidia.com/en-us/data-center/volta-gpu-architecture/) or [Turing](https://www.nvidia.com/en-us/geforce/turing/) based GPU
+* [PyTorch 22.10 NGC container](https://ngc.nvidia.com/registry/nvidia-pytorch)
+* GPU-based architecture:
+    * [NVIDIA Volta](https://www.nvidia.com/en-us/data-center/volta-gpu-architecture/)
+    * [NVIDIA Turing](https://www.nvidia.com/en-us/geforce/turing/)
+    * [NVIDIA Ampere architecture](https://www.nvidia.com/en-us/data-center/nvidia-ampere-gpu-architecture/)
 
 For more information about how to get started with NGC containers, see the
 following sections from the NVIDIA GPU Cloud Documentation and the Deep Learning
@@ -256,14 +235,14 @@ Documentation:
 * [Accessing And Pulling From The NGC Container Registry](https://docs.nvidia.com/deeplearning/dgx/user-guide/index.html#accessing_registry)
 * [Running PyTorch](https://docs.nvidia.com/deeplearning/dgx/pytorch-release-notes/running.html#running)
 
-For those unable to use the [PyTorch 19.08-py3 NGC container](https://ngc.nvidia.com/registry/nvidia-pytorch),
+For those unable to use the [PyTorch 22.10 NGC container](https://ngc.nvidia.com/registry/nvidia-pytorch),
 to set up the required environment or create your own container,
 see the versioned [NVIDIA Container Support Matrix](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html).
 
 
 ## Quick Start Guide
 
-To train your model using mixed precision with Tensor Cores or using FP32,
+To train your model using mixed or TF32 precision with Tensor Cores or using FP32,
 perform the following steps using the default parameters of the SSD v1.1 model
 on the [COCO 2017](http://cocodataset.org/#download) dataset.
 For the specifics concerning training and inference,
@@ -289,7 +268,7 @@ docker build . -t nvidia_ssd
 
 4. Start an interactive session in the NGC container to run training/inference.
 ```
-nvidia-docker run --rm -it --ulimit memlock=-1 --ulimit stack=67108864 -v $COCO_DIR:/coco --ipc=host nvidia_ssd
+docker run --rm -it --gpus=all --ipc=host -v $COCO_DIR:/coco nvidia_ssd
 ```
 
 **Note**: the default mount point in the container is `/coco`.
@@ -304,41 +283,21 @@ The example scripts need two arguments:
 
 Remaining arguments are passed to the `main.py` script.
 
-The `--save` flag, saves the model after each epoch.
-The checkpoints are stored as `./models/epoch_*.pt`.
+The `--save save_dir` flag, saves the model after each epoch in `save_dir` directory.
+The checkpoints are stored as `<save_dir>/epoch_*.pt`.
 
 Use `python main.py -h` to obtain the list of available options in the `main.py` script.
 For example, if you want to run 8 GPU training with Tensor Core acceleration and
 save checkpoints after each epoch, run:
 
 ```
-bash ./examples/SSD300_FP16_8GPU.sh . /coco --save
+bash ./examples/SSD300_FP16_8GPU.sh . /coco --save $SSD_CHECKPINT_PATH
 ```
 
 6. Start validation/evaluation.
 
 The `main.py` training script automatically runs validation during training.
 The results from the validation are printed to `stdout`.
-
-Pycocotools’ open-sourced scripts provides a consistent way
-to evaluate models on the COCO dataset. We are using these scripts
-during validation to measure a models performance in AP metric.
-Metrics below are evaluated using pycocotools’ methodology, in the following format:
-```
- Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.250
- Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.423
- Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.257
- Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.076
- Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.269
- Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.399
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.237
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.342
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.358
- Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.118
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.394
- Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.548
-```
-The metric reported in our results is present in the first row.
 
 To evaluate a checkpointed model saved in the previous point, run:
 
@@ -357,31 +316,8 @@ python ./main.py --backbone resnet50 --checkpoint ./models/epoch_*.pt --data /co
 You can check your trained model with a Jupyter notebook provided in the examples directory.
 Start with running a Docker container with a Jupyter notebook server:
 ```
-nvidia-docker run --rm -it --ulimit memlock=-1 --ulimit stack=67108864 -v $SSD_CHECKPINT_PATH:/checkpoints/SSD300v1.1.pt -v $COCO_PATH:/datasets/coco2017 --ipc=host -p 8888:8888 nvidia_ssd jupyter-notebook --ip 0.0.0.0 --allow-root
+docker run --rm -it --gpus=all --ipc=host -v $SSD_CHECKPOINT_PATH:/checkpoints/SSD300v1.1.pt -v $COCO_PATH:/datasets/coco2017 -p 8888:8888 nvidia_ssd jupyter-notebook --ip 0.0.0.0 --allow-root
 ```
-
-The container prints Jupyter notebook logs like this:
-```
-[I 16:17:58.935 NotebookApp] Writing notebook server cookie secret to /root/.local/share/jupyter/runtime/notebook_cookie_secret
-[I 16:17:59.769 NotebookApp] JupyterLab extension loaded from /opt/conda/lib/python3.6/site-packages/jupyterlab
-[I 16:17:59.769 NotebookApp] JupyterLab application directory is /opt/conda/share/jupyter/lab
-[I 16:17:59.770 NotebookApp] Serving notebooks from local directory: /workspace
-[I 16:17:59.770 NotebookApp] The Jupyter Notebook is running at: 
-[I 16:17:59.770 NotebookApp] http://(65935d756c71 or 127.0.0.1):8888/?token=04c78049c67f45a4d759c8f6ddd0b2c28ac4eab60d81be4e
-[I 16:17:59.770 NotebookApp] Use Control-C to stop this server and shut down all kernels (twice to skip confirmation).
-[W 16:17:59.774 NotebookApp] No web browser found: could not locate runnable browser.
-[C 16:17:59.774 NotebookApp] 
-        
-    To access the notebook, open this file in a browser:
-        file:///root/.local/share/jupyter/runtime/nbserver-1-open.html
-    Or copy and paste one of these URLs:
-        http://(65935d756c71 or 127.0.0.1):8888/?token=04c78049c67f45a4d759c8f6ddd0b2c28ac4eab60d81be4e
-```
-
-Use the token printed in the last line to start your notebook session.
-The notebook is in `examples/inference.ipynb`, for example:
-
-http://127.0.0.1:8888/notebooks/examples/inference.ipynb?token=04c78049c67f45a4d759c8f6ddd0b2c28ac4eab60d81be4e
 
 ## Advanced
 
@@ -396,7 +332,7 @@ In the root directory, the most important files are:
  - `requirements.txt`:      a set of extra Python requirements for running SSD300 v1.1;
  - `download_dataset.py`:   automatically downloads the COCO dataset for training.
 
-The `src/` directory contains modules used to train and evaluate the SSD300 v1.1 model
+The `ssd/` directory contains modules used to train and evaluate the SSD300 v1.1 model
  - `model.py`: the definition of SSD300 v1.1 model
  - `data.py`: definition of input pipelines used in training and evaluation
  - `train.py`: functions used to train the SSD300 v1.1 model
@@ -423,7 +359,7 @@ under the `/coco` directory.
 : allows you to specify the path to the pre-trained model.
 
 `--save`
-: when the flag is turned on, the script will save the trained model to the disc.
+: when the flag is turned on, the script will save the trained model checkpoints in the specified directory
 
 `--seed`
 : Use it to specify the seed for RNGs.
@@ -498,7 +434,7 @@ Our model expects input data aligned in a way a COCO dataset is aligned by the `
 `train2017` and `val2017` directories should contain images in JPEG format.
 Annotation format is described in [the COCO documentation](http://cocodataset.org/#format-data).
 
-The preprocessing of the data is defined in the `src/coco_pipeline.py` module.
+The preprocessing of the data is defined in the `ssd/coco_pipeline.py` module.
 
 ##### Data preprocessing
 
@@ -530,7 +466,29 @@ the COCO dataset.
  Which epochs should be evaluated can be reconfigured with the `--evaluation` argument.
 
 To run training with Tensor Cores, use the `--amp` flag when running the `main.py` script.
-The flag `--save` flag enables storing checkpoints after each epoch under `./models/epoch_*.pt`.
+The flag `--save ./models` flag enables storing checkpoints after each epoch under `./models/epoch_*.pt`.
+
+### Evaluation process
+
+Pycocotools’ open-sourced scripts provides a consistent way
+to evaluate models on the COCO dataset. We are using these scripts
+during validation to measure a models performance in AP metric.
+Metrics below are evaluated using pycocotools’ methodology, in the following format:
+```
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.27205
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.45869
+ Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.27884
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.08275
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.29840
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.42722
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.25092
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.36528
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.38262
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.13577
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.42287
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.57277
+```
+The metric reported in our results is present in the first row.
 
 ### Inference process
 
@@ -539,11 +497,40 @@ To get meaningful results, you need a pre-trained model checkpoint.
 
 One way is to run an interactive session on Jupyter notebook, as described in a 8th step of the [Quick Start Guide](#quick-start-guide).
 
+The container prints Jupyter notebook logs like this:
+```
+[I 16:17:58.935 NotebookApp] Writing notebook server cookie secret to /root/.local/share/jupyter/runtime/notebook_cookie_secret
+[I 16:17:59.769 NotebookApp] JupyterLab extension loaded from /opt/conda/lib/python3.6/site-packages/jupyterlab
+[I 16:17:59.769 NotebookApp] JupyterLab application directory is /opt/conda/share/jupyter/lab
+[I 16:17:59.770 NotebookApp] Serving notebooks from local directory: /workspace
+[I 16:17:59.770 NotebookApp] The Jupyter Notebook is running at:
+[I 16:17:59.770 NotebookApp] http://(65935d756c71 or 127.0.0.1):8888/?token=04c78049c67f45a4d759c8f6ddd0b2c28ac4eab60d81be4e
+[I 16:17:59.770 NotebookApp] Use Control-C to stop this server and shut down all kernels (twice to skip confirmation).
+[W 16:17:59.774 NotebookApp] No web browser found: could not locate runnable browser.
+[C 16:17:59.774 NotebookApp]
+
+    To access the notebook, open this file in a browser:
+        file:///root/.local/share/jupyter/runtime/nbserver-1-open.html
+    Or copy and paste one of these URLs:
+        http://(65935d756c71 or 127.0.0.1):8888/?token=04c78049c67f45a4d759c8f6ddd0b2c28ac4eab60d81be4e
+```
+
+Use the token printed in the last line to start your notebook session.
+The notebook is in `examples/inference.ipynb`, for example:
+
+http://127.0.0.1:8888/notebooks/examples/inference.ipynb?token=04c78049c67f45a4d759c8f6ddd0b2c28ac4eab60d81be4e
+
 Another way is to run a script `examples/SSD300_inference.py`. It contains the logic from the notebook, wrapped into a Python script. The script contains sample usage.
 
 To use the inference example script in your own code, you can call the `main` function, providing input image URIs as an argument. The result will be a list of detections for each input image.
 
+
+
+
+
 ## Performance
+
+The performance measurements in this document were conducted at the time of publication and may not reflect the performance achieved from NVIDIA’s latest software release. For the most up-to-date performance measurements, go to [NVIDIA Data Center Deep Learning Product Performance](https://developer.nvidia.com/deep-learning-performance-training-inference).
 
 ### Benchmarking
 
@@ -551,11 +538,11 @@ The following section shows how to run benchmarks measuring the model performanc
 
 #### Training performance benchmark
 
-The training benchmark was run in various scenarios on V100 16G GPU. For each scenario, the batch size was set to 32. The benchmark does not require a checkpoint from a fully trained model.
+The training benchmark was run in various scenarios on A100 80GB and V100 16G GPUs. The benchmark does not require a checkpoint from a fully trained model.
 
 To benchmark training, run:
 ```
-python -m torch.distributed.launch --nproc_per_node={NGPU} \
+torchrun --nproc_per_node={NGPU} \
        main.py --batch-size {bs} \
                --mode benchmark-training \
                --benchmark-warmup 100 \
@@ -573,7 +560,7 @@ Tensor Cores, and the `{data}` is the location of the COCO 2017 dataset.
 
 #### Inference performance benchmark
 
-Inference benchmark was run on 1x V100 16G GPU.  To benchmark inference, run:
+Inference benchmark was run on 1x A100 80GB GPU and 1x V100 16G GPU. To benchmark inference, run:
 ```
 python main.py --eval-batch-size {bs} \
                --mode benchmark-inference \
@@ -593,72 +580,186 @@ The following sections provide details on how we achieved our performance and ac
 
 #### Training accuracy results
 
+##### Training accuracy: NVIDIA DGX A100 (8x A100 80GB)
 
-##### NVIDIA DGX-1 (8x V100 16G)
+Our results were obtained by running the `./examples/SSD300_A100_{FP16,TF32}_{1,4,8}GPU.sh`
+script in the `pytorch-22.10-py3` NGC container on NVIDIA DGX A100 (8x A100 80GB) GPUs.
+
+|GPUs       |Batch size / GPU|Accuracy - TF32|Accuracy  - mixed precision|Time to train - TF32|Time to train  - mixed precision|Time to train speedup  (TF32 to mixed precision)|
+|-----------|----------------|---------------|---------------------------|--------------------|--------------------------------|------------------------------------------------|
+|1          |64              |0.271          |0.272                      |03:19:59            |03:18:35                        |100%                                            |
+|4          |64              |0.270          |0.270                      |00:51:22            |00:51:31                        | 99%                                            |
+|8          |64              |0.270          |0.269                      |00:26:10            |00:26:10                        | 99%                                            |
+|1          |128             |0.274          |0.271                      |03:03:56            |03:03:50                        |100%                                            |
+|4          |128             |0.272          |0.270                      |00:46:51            |00:47:01                        | 99%                                            |
+|8          |128             |0.267          |0.267                      |00:23:44            |00:23:46                        | 99%                                            |
+|1          |256             |0.272          |0.272                      |02:56:37            |02:56:44                        | 99%                                            |
+|4          |256             |0.271          |0.267                      |00:45:05            |00:45:07                        | 99%                                            |
+|8          |256             |0.260          |0.258                      |00:22:49            |00:22:56                        |100%                                            |
+
+##### Training accuracy: NVIDIA DGX-1 (8x V100 16GB)
 
 Our results were obtained by running the `./examples/SSD300_FP{16,32}_{1,4,8}GPU.sh`
-script in the `pytorch-19.08-py3` NGC container on NVIDIA DGX-1 with 8x
-V100 16G GPUs. Performance numbers (in items/images per second) were averaged
-over an entire training epoch.
+script in the `pytorch-22.10-py3` NGC container on NVIDIA DGX-1 with 8x
+V100 16GB GPUs.
 
 |GPUs       |Batch size / GPU|Accuracy - FP32|Accuracy  - mixed precision|Time to train - FP32|Time to train  - mixed precision|Time to train speedup  (FP32 to mixed precision)|
 |-----------|----------------|---------------|---------------------------|--------------------|--------------------------------|------------------------------------------------|
-|1          |32              |0.250          |0.250                      |20:20:13            |10:23:46                        |195.62%                                         |
-|4          |32              |0.249          |0.250                      |5:11:17             |2:39:28                         |195.20%                                         |
-|8          |32              |0.250          |0.250                      |2:37:35             |1:25:38                         |184.01%                                         |
-|1          |64              |<N/A>          |0.252                      |<N/A>               |9:27:33                         |215.00%                                         |
-|4          |64              |<N/A>          |0.251                      |<N/A>               |2:24:43                         |215.10%                                         |
-|8          |64              |<N/A>          |0.252                      |<N/A>               |1:13:01                         |215.85%                                         |
+|1          |32              |0.269          |0.271                      |20:04:48            |07:25:27                        |270%                                            |
+|4          |32              |0.270          |0.269                      |05:08:56            |01:58:41                        |260%                                            |
+|8          |32              |0.271          |0.269                      |02:35:00            |01:00:27                        |256%                                            |
+|1          |64              |<N/A>          |0.272                      |<N/A>               |06:47:58                        |<N/A>                                           |
+|4          |64              |<N/A>          |0.270                      |<N/A>               |01:46:34                        |<N/A>                                           |
+|8          |64              |<N/A>          |0.269                      |<N/A>               |00:53:52                        |<N/A>                                           |
 
-Here are example graphs of FP32 and FP16 training on 8 GPU configuration:
+Due to smaller size, mixed precision models can be trained with bigger batches. In such cases mixed precision speedup is calculated versus FP32 training with maximum batch size for that precision
+
+##### Training loss plot
+
+Here are example graphs of FP32, TF32 and AMP training on 8 GPU configuration:
 
 ![TrainingLoss](./img/training_loss.png)
 
-![ValidationAccuracy](./img/validation_accuracy.png)
+##### Training stability test
 
+The SSD300 v1.1 model was trained for 65 epochs, starting
+from 15 different initial random seeds. The training was performed in the `pytorch-22.10-py3` NGC container on
+NVIDIA DGX A100 8x A100 80GB GPUs with batch size per GPU = 128.
+After training, the models were evaluated on the test dataset. The following
+table summarizes the final mAP on the test set.
+
+|**Precision**|**Average mAP**|**Standard deviation**|**Minimum**|**Maximum**|**Median**|
+|------------:|--------------:|---------------------:|----------:|----------:|---------:|
+| AMP         | 0.2679503039  | 0.001360494012       | 0.26201   | 0.27013   | 0.26529  |
+| TF32        | 0.2670691823  | 0.001639394102       | 0.26181   | 0.27274   | 0.26492  |
 
 #### Training performance results
 
-##### NVIDIA DGX-1 (8x V100 16G)
+##### Training performance: NVIDIA DGX A100 (8x A100 80GB)
 
 Our results were obtained by running the `main.py` script with the `--mode
-benchmark-training` flag in the `pytorch-19.08-py3` NGC container on NVIDIA
-DGX-1 with 8x V100 16G GPUs. Performance numbers (in items/images per second)
+benchmark-training` flag in the `pytorch-22.10-py3` NGC container on NVIDIA
+DGX A100 (8x A100 80GB) GPUs. Performance numbers (in items/images per second)
+were averaged over an entire training epoch.
+
+|GPUs       |Batch size / GPU|Throughput - TF32|Throughput  - mixed precision|Throughput speedup (TF32 - mixed precision)|Weak scaling - TF32             |Weak scaling  - mixed precision                 |
+|-----------|----------------|-----------------|-----------------------------|-------------------------------------------|--------------------------------|------------------------------------------------|
+|1          |64              | 364.27          | 662.91                      |181%                                       |100%                            |100%                                            |
+|4          |64              |1432.73          |2581.24                      |180%                                       |393%                            |389%                                            |
+|8          |64              |2838.76          |5252.84                      |185%                                       |779%                            |792%                                            |
+|1          |128             | 377.18          | 724.41                      |192%                                       |100%                            |100%                                            |
+|4          |128             |1493.13          |2885.55                      |193%                                       |395%                            |398%                                            |
+|8          |128             |2967.23          |5733.98                      |193%                                       |786%                            |791%                                            |
+
+To achieve these same results, follow the [Quick Start Guide](#quick-start-guide) outlined above.
+
+##### Training performance: NVIDIA DGX-1 (8x V100 16GB)
+
+Our results were obtained by running the `main.py` script with the `--mode
+benchmark-training` flag in the `pytorch-22.10-py3` NGC container on NVIDIA
+DGX-1 with 8x V100 16GB GPUs. Performance numbers (in items/images per second)
 were averaged over an entire training epoch.
 
 |GPUs       |Batch size / GPU|Throughput - FP32|Throughput  - mixed precision|Throughput speedup (FP32 - mixed precision)|Weak scaling - FP32             |Weak scaling  - mixed precision                 |
 |-----------|----------------|-----------------|-----------------------------|-------------------------------------------|--------------------------------|------------------------------------------------|
-|1          |32              |133.67           |215.30                       |161.07%                                    |100.00%                         |100.00%                                         |
-|4          |32              |532.05           |828.63                       |155.74%                                    |398.04%                         |384.88%                                         |
-|8          |32              |1,060.33         |1,647.74                     |155.40%                                    |793.27%                         |765.33%                                         |
-|1          |64              |<N/A>            |232.22                       |173.73%                                    |<N/A>                           |100.00%                                         |
-|4          |64              |<N/A>            |910.77                       |171.18%                                    |<N/A>                           |392.20%                                         |
-|8          |64              |<N/A>            |1,769.48                     |166.88%                                    |<N/A>                           |761.99%                                         |
+|1          |32              |107.22           | 296.80                      |276%                                       |100%                            |100%                                            |
+|4          |32              |419.54           |1115.59                      |265%                                       |391%                            |375%                                            |
+|8          |32              |840.35           |2153.96                      |256%                                       |783%                            |725%                                            |
+|1          |64              |<N/A>            | 322.81                      |<N/A>                                      |<N/A>                           |100%                                            |
+|4          |64              |<N/A>            |1238.27                      |<N/A>                                      |<N/A>                           |383%                                            |
+|8          |64              |<N/A>            |2520.50                      |<N/A>                                      |<N/A>                           |780%                                            |
+
+Due to smaller size, mixed precision models can be trained with bigger batches. In such cases mixed precision speedup is calculated versus FP32 training with maximum batch size for that precision
 
 To achieve these same results, follow the [Quick Start Guide](#quick-start-guide) outlined above.
 
 #### Inference performance results
 
-
-##### NVIDIA DGX-1 (1x V100 16G)
+##### Inference performance: NVIDIA DGX A100 (1x A100 80GB)
 
 Our results were obtained by running the `main.py` script with `--mode
-benchmark-inference` flag in the pytorch-19.08-py3 NGC container on NVIDIA
-DGX-1 with (1x V100 16G) GPUs.
+benchmark-inference` flag in the pytorch-22.10-py3 NGC container on NVIDIA
+DGX A100 (1x A100 80GB) GPU.
+
+|Batch size |Throughput - TF32|Throughput  - mixed precision|Throughput speedup (TF32 - mixed precision)|Weak scaling - TF32 |Weak scaling  - mixed precision |
+|-----------|-----------------|-----------------------------|-------------------------------------------|--------------------|--------------------------------|
+|1          |158.83           | 142.67                      | 89%                                       |100%                |100%                           |
+|2          |308.31           | 261.21                      | 84%                                       |194%                |183%                           |
+|4          |481.69           | 454.95                      | 94%                                       |303%                |318%                           |
+|8          |597.72           | 742.05                      |124%                                       |376%                |520%                           |
+|16         |590.44           | 887.01                      |150%                                       |371%                |621%                           |
+|32         |708.97           | 970.27                      |136%                                       |446%                |680%                           |
+|64         |798.16           |1057.51                      |132%                                       |502%                |741%                           |
+
+To achieve these same results, follow the [Quick Start Guide](#quick-start-guide) outlined above.
+
+##### Inference performance: NVIDIA DGX-1 (1x V100 16GB)
+
+Our results were obtained by running the `main.py` script with `--mode
+benchmark-inference` flag in the pytorch-22.10-py3 NGC container on NVIDIA
+DGX-1 with (1x V100 16GB) GPU.
 
 |Batch size |Throughput - FP32|Throughput  - mixed precision|Throughput speedup (FP32 - mixed precision)|Weak scaling - FP32 |Weak scaling  - mixed precision |
 |-----------|-----------------|-----------------------------|-------------------------------------------|--------------------|--------------------------------|
-|2          |148.99           |186.60                       |125.24%                                    |100.00%             |100.00%                         |
-|4          |203.35           |326.69                       |160.66%                                    |136.48%             |175.08%                         |
-|8          |227.32           |433.45                       |190.68%                                    |152.57%             |232.29%                         |
-|16         |278.02           |493.19                       |177.39%                                    |186.60%             |264.31%                         |
-|32         |299.81           |545.84                       |182.06%                                    |201.23%             |292.53%                         |
+|1          | 93.21           | 84.59                       | 90%                                       |100%                |100%                            |
+|2          |148.61           |165.30                       |111%                                       |159%                |195%                            |
+|4          |206.82           |304.77                       |147%                                       |221%                |360%                            |
+|8          |242.55           |447.25                       |184%                                       |260%                |528%                            |
+|16         |292.44           |541.05                       |185%                                       |313%                |639%                            |
+|32         |311.61           |605.30                       |194%                                       |334%                |715%                            |
 
 To achieve these same results, follow the [Quick Start Guide](#quick-start-guide) outlined above.
 
 ## Release notes
 
 ### Changelog
+
+October 2022
+ * upgrade the PyTorch container to 22.10
+ * switched to using torchvision IMAGENET1K_V2 backbone weights
+ * added a flag to control for torchvision weight enums
+ * added a flag to control TF32 computations
+ * fixed various depreciation warnings
+ * set `TORCH_CUDNN_V8_API_ENABLED` environment variable which replaces `CUDNN_V8_API_ENABLED` from older containers
+ * updated [nv-cocoapi](https://github.com/NVIDIA/cocoapi/) from 0.6.0 to 0.7.3
+ * updated python dependencies
+
+June 2022
+ * upgrade the PyTorch container to 22.05
+ * fixed DALI depreciation warnings
+
+January 2022
+ * upgrade the PyTorch container to 22.01
+ * made AMP the default data precision
+ * added --data-layout option (channels_first is the recommended layout with --no-amp)
+ * updated README with new performance numbers
+
+November 2021
+ * upgrade the PyTorch container to 21.11
+ * switched data layout from NCHW (channels first) to NHWC (channels last)
+ * replaced `torch.distributed.launch` with `torchrun`
+ * updated README with new performance numbers
+
+May 2021
+ * upgrade the PyTorch container to 21.05
+ * replaced APEX AMP with native PyTorch AMP
+ * updated [nv-cocoapi](https://github.com/NVIDIA/cocoapi/) from 0.4.0 to 0.6.0
+ * code updated to use DALI 1.2.0
+
+April 2021
+ * upgrade the PyTorch container to 21.04
+ * changed python package naming
+
+March 2021
+ * upgrade the PyTorch container to 21.03
+ * code updated to use DALI 0.30.0
+ * use DALI [BoxEncoder](https://docs.nvidia.com/deeplearning/dali/user-guide/docs/supported_ops.html#nvidia.dali.ops.BoxEncoder) instead of a CUDA extension
+ * replaced [cocoapi](https://github.com/cocodataset/cocoapi) with [nv-cocoapi](https://github.com/NVIDIA/cocoapi/)
+
+June 2020
+ * upgrade the PyTorch container to 20.06
+ * update performance tables to include A100 results
+ * update examples with A100 configs
 
 August 2019
  * upgrade the PyTorch container to 19.08

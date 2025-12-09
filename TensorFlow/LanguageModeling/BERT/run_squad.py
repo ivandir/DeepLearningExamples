@@ -36,7 +36,8 @@ import modeling
 import optimization
 import tokenization
 from utils.create_squad_data import *
-from utils.utils import LogEvalRunHook, LogTrainRunHook
+from utils.utils import LogEvalRunHook, LogTrainRunHook, setup_xla_flags
+from utils.gpu_affinity import set_affinity
 import utils.dllogger_class
 from dllogger import Verbosity
 
@@ -121,8 +122,10 @@ def extract_run_squad_flags():
       "Proportion of training to perform linear learning rate warmup for. "
       "E.g., 0.1 = 10% of training.")
 
-  flags.DEFINE_integer("save_checkpoints_steps", 1000,
+  flags.DEFINE_integer("save_checkpoints_steps", 5000,
                        "How often to save the model checkpoint.")
+  flags.DEFINE_integer("display_loss_steps", 10,
+                       "How often to print loss from estimator")
 
   flags.DEFINE_integer("iterations_per_loop", 1000,
                        "How many steps to make in each estimator call.")
@@ -155,8 +158,8 @@ def extract_run_squad_flags():
       "null_score_diff_threshold", 0.0,
       "If null_score - best_non_null is greater than the threshold predict null.")
 
-  flags.DEFINE_bool("use_fp16", False, "Whether to use fp32 or fp16 arithmetic on GPU.")
-  flags.DEFINE_bool("use_xla", False, "Whether to enable XLA JIT compilation.")
+  flags.DEFINE_bool("amp", True, "Whether to enable AMP ops. When false, uses TF32 on A100 and FP32 on V100 GPUS.")
+  flags.DEFINE_bool("use_xla", True, "Whether to enable XLA JIT compilation.")
   flags.DEFINE_integer("num_eval_iterations", None,
                        "How many eval iterations to run - performs inference on subset")
 
@@ -257,7 +260,7 @@ def get_frozen_tftrt_model(bert_config, shape, use_one_hot_embeddings, init_chec
         input_graph_def=frozen_graph,
         nodes_blacklist=output_node_names,
         max_workspace_size_bytes=(4096 << 20) - 1000,
-        precision_mode = "FP16" if FLAGS.use_fp16 else "FP32",
+        precision_mode = "FP16" if FLAGS.amp else "FP32",
         minimum_segment_size=4,
         is_dynamic_op=True,
         maximum_cached_engines=1000
@@ -277,7 +280,7 @@ def get_frozen_tftrt_model(bert_config, shape, use_one_hot_embeddings, init_chec
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps,
-                     hvd=None, use_fp16=False, use_one_hot_embeddings=False):
+                     hvd=None, amp=False, use_one_hot_embeddings=False):
   """Returns `model_fn` closure for Estimator."""
 
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -323,9 +326,9 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     if init_checkpoint and (hvd is None or hvd.rank() == 0):
       (assignment_map, initialized_variable_names
       ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-
+      
       tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-    
+
     if FLAGS.verbose_logging:
         tf.compat.v1.logging.info("**** Trainable Variables ****")
         for var in tvars:
@@ -357,15 +360,23 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
       total_loss = (start_loss + end_loss) / 2.0
 
       train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, hvd, False, use_fp16, FLAGS.num_accumulation_steps)
+          total_loss, learning_rate, num_train_steps, num_warmup_steps, hvd, False, amp, FLAGS.num_accumulation_steps)
 
       output_spec = tf.estimator.EstimatorSpec(
           mode=mode,
           loss=total_loss,
           train_op=train_op)
     elif mode == tf.estimator.ModeKeys.PREDICT:
+
+      dummy_op = tf.no_op()
+      # Need to call mixed precision graph rewrite if fp16 to enable graph rewrite
+      if amp:
+        loss_scaler = tf.train.experimental.FixedLossScale(1)
+        dummy_op = tf.train.experimental.enable_mixed_precision_graph_rewrite(
+            optimization.LAMBOptimizer(learning_rate=0.0), loss_scaler)
+
       predictions = {
-          "unique_ids": unique_ids,
+          "unique_ids": tf.identity(unique_ids),
           "start_logits": start_logits,
           "end_logits": end_logits,
       }
@@ -554,7 +565,6 @@ def get_predictions(all_examples, all_features, all_results, n_best_size, max_an
       else:
         final_text = ""
         seen_predictions[final_text] = True
-
       nbest.append(
           _NbestPrediction(
               text=final_text,
@@ -604,7 +614,12 @@ def get_predictions(all_examples, all_features, all_results, n_best_size, max_an
       score_diff = score_null - best_non_null_entry.start_logit - (
           best_non_null_entry.end_logit)
       scores_diff_json[example.qas_id] = score_diff
-      if score_diff > FLAGS.null_score_diff_threshold:
+
+      try:
+        null_score_diff_threshold = FLAGS.null_score_diff_threshold
+      except:
+        null_score_diff_threshold = 0.0
+      if score_diff > null_score_diff_threshold:
         all_predictions[example.qas_id] = ""
       else:
         all_predictions[example.qas_id] = best_non_null_entry.text
@@ -798,8 +813,6 @@ def validate_flags_or_throw(bert_config):
 
 def export_model(estimator, export_dir, init_checkpoint):
     """Exports a checkpoint in SavedModel format in a directory structure compatible with Triton."""
-
-
     def serving_input_fn():
         label_ids = tf.placeholder(tf.int32, [None,], name='unique_ids')
         input_ids = tf.placeholder(tf.int32, [None, FLAGS.max_seq_length], name='input_ids')
@@ -845,6 +858,19 @@ def export_model(estimator, export_dir, init_checkpoint):
     # Now build the config for Triton. Check to make sure we can overwrite it, if it exists
     config_filename = os.path.join(model_folder, "config.pbtxt")
 
+    optimization_str = ""
+    if FLAGS.amp:
+      optimization_str = r"""
+optimization {
+  execution_accelerators
+  {
+    gpu_execution_accelerator :
+    [ {
+      name : "auto_mixed_precision"
+    } ]
+  }
+}"""
+
     if (os.path.exists(config_filename) and not FLAGS.triton_model_overwrite):
         print("ERROR: Could not save Triton model config. Config file already exists. Use '--triton_model_overwrite=True' if you would like to overwrite an existing model config. Model config: {}".format(config_filename))
         return
@@ -853,6 +879,7 @@ def export_model(estimator, export_dir, init_checkpoint):
 name: "{model_name}"
 platform: "tensorflow_savedmodel"
 max_batch_size: {max_batch_size}
+{optimization_str}
 input [
     {{
         name: "unique_ids"
@@ -892,8 +919,6 @@ input [
 instance_group [
     {{
         count: {engine_count}
-        kind: KIND_GPU
-        gpus: [{gpu_list}]
     }}
 ]"""
 
@@ -916,8 +941,8 @@ dynamic_batching {{
         "max_batch_size": max_batch_size,
         "seq_length": FLAGS.max_seq_length,
         "dynamic_batching": batching_str,
-        "gpu_list": ", ".join([x.name.split(":")[-1] for x in device_lib.list_local_devices() if x.device_type == "GPU"]),
-        "engine_count": FLAGS.triton_engine_count
+        "engine_count": FLAGS.triton_engine_count,
+        "optimization_str":optimization_str,
     }
 
     with open(model_folder + "/config.pbtxt", "w") as file:
@@ -926,7 +951,7 @@ dynamic_batching {{
         file.write(final_config_str)
 
 def main(_):
-  os.environ["TF_XLA_FLAGS"] = "--tf_xla_enable_lazy_compilation=false" #causes memory fragmentation for bert leading to OOM
+  setup_xla_flags()
 
   tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
   dllogging = utils.dllogger_class.dllogger_class(FLAGS.dllog_path)
@@ -959,14 +984,20 @@ def main(_):
       master_process = (hvd.rank() == 0)
       hvd_rank = hvd.rank()
       config.gpu_options.visible_device_list = str(hvd.local_rank())
+      set_affinity(hvd.local_rank())
       if hvd.size() > 1:
           training_hooks.append(hvd.BroadcastGlobalVariablesHook(0))
   if FLAGS.use_xla:
     config.graph_options.optimizer_options.global_jit_level = tf.compat.v1.OptimizerOptions.ON_1
+    if FLAGS.amp:
+        tf.enable_resource_variables()
+
   run_config = tf.estimator.RunConfig(
       model_dir=FLAGS.output_dir if master_process else None,
       session_config=config,
       save_checkpoints_steps=FLAGS.save_checkpoints_steps if master_process else None,
+      save_summary_steps=FLAGS.save_checkpoints_steps if master_process else None,
+      log_step_count_steps=FLAGS.display_loss_steps,
       keep_checkpoint_max=1)
 
   if master_process:
@@ -1017,7 +1048,7 @@ def main(_):
       num_train_steps=num_train_steps,
       num_warmup_steps=num_warmup_steps,
       hvd=None if not FLAGS.horovod else hvd,
-      use_fp16=FLAGS.use_fp16)
+      amp=FLAGS.amp)
 
   estimator = tf.estimator.Estimator(
       model_fn=model_fn,
@@ -1160,7 +1191,7 @@ def main(_):
     tf.compat.v1.logging.info("Summary Inference Statistics")
     tf.compat.v1.logging.info("Batch size = %d", FLAGS.predict_batch_size)
     tf.compat.v1.logging.info("Sequence Length = %d", FLAGS.max_seq_length)
-    tf.compat.v1.logging.info("Precision = %s", "fp16" if FLAGS.use_fp16 else "fp32")
+    tf.compat.v1.logging.info("Precision = %s", "fp16" if FLAGS.amp else "fp32")
     tf.compat.v1.logging.info("Latency Confidence Level 50 (ms) = %0.2f", cf_50 * 1000)
     tf.compat.v1.logging.info("Latency Confidence Level 90 (ms) = %0.2f", cf_90 * 1000)
     tf.compat.v1.logging.info("Latency Confidence Level 95 (ms) = %0.2f", cf_95 * 1000)

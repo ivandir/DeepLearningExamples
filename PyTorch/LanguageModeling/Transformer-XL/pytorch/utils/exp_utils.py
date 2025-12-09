@@ -1,4 +1,4 @@
-# Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2019-2020, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import datetime
 import logging
 import os
 import shutil
+import signal
 import sys
 import time
 
@@ -52,6 +54,41 @@ class AverageMeter:
             self.avg = self.sum / self.count
             if self.keep:
                 self.vals.append(val)
+
+
+class TimeoutHandler:
+    def __init__(self, sig=signal.SIGTERM):
+        self.sig = sig
+
+    def __enter__(self):
+        self.interrupted = False
+        self.released = False
+        self.original_handler = signal.getsignal(self.sig)
+
+        def handler(signum, frame):
+            self.release()
+            self.interrupted = True
+            logging.info(f'Received SIGTERM')
+
+        signal.signal(self.sig, handler)
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.release()
+
+    def release(self):
+        if self.released:
+            return False
+
+        signal.signal(self.sig, self.original_handler)
+        self.released = True
+        return True
+
+
+def register_ignoring_timeout_handler(sig=signal.SIGTERM):
+    def handler(signum, frame):
+        logging.info('Received SIGTERM, ignoring')
+    signal.signal(sig, handler)
 
 
 def log_env_info():
@@ -118,6 +155,10 @@ def setup_logging(log_all_ranks=True, filename=os.devnull, filemode='w'):
         if rank != 0:
             filename = os.devnull
 
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+        handler.close()
+
     logging.basicConfig(level=logging.DEBUG,
                         format=logging_format,
                         datefmt="%Y-%m-%d %H:%M:%S",
@@ -175,3 +216,50 @@ def build_work_dir_name(work_dir, dataset, append_dataset, append_time):
 
         work_dir = os.path.join(work_dir, now_str)
     return work_dir
+
+
+def l2_promote():
+    _libcudart = ctypes.CDLL('libcudart.so')
+    # Set device limit on the current device
+    # cudaLimitMaxL2FetchGranularity = 0x05
+    pValue = ctypes.cast((ctypes.c_int*1)(), ctypes.POINTER(ctypes.c_int))
+    _libcudart.cudaDeviceSetLimit(ctypes.c_int(0x05), ctypes.c_int(128))
+    _libcudart.cudaDeviceGetLimit(pValue, ctypes.c_int(0x05))
+    assert pValue.contents.value == 128
+
+
+def get_default_rng_states(device):
+    """
+    Get states of default random generators from all devices participating in a
+    distributed training.
+
+    If device == torch.device('cuda') it returns states of CUDA generators, if
+    device == torch.device('cpu') it returns states of host generators.
+
+    Returns a list of random states indexed with a distributed rank. All
+    generator states are in host memory.
+    """
+    if device == torch.device('cuda'):
+        state = torch.cuda.get_rng_state()
+    elif device == torch.device('cpu'):
+        state = torch.random.get_rng_state()
+    else:
+        raise RuntimeError('Unknown device')
+
+    states = utils.distributed.all_gather_tensors(state, device)
+    states = [state.to(torch.device('cpu')) for state in states]
+    return states
+
+
+def set_default_rng_states(rng_states, device):
+    """
+    Sets states of default random generators for all devices participating in a
+    distributed training.
+    """
+    rank = utils.distributed.get_rank()
+    rng_states = [s.to(torch.device('cpu')) for s in rng_states]
+
+    if device == torch.device('cuda'):
+        torch.cuda.set_rng_state(rng_states[rank])
+    elif device.type == 'cpu':
+        torch.random.set_rng_state(rng_states[rank])

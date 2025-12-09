@@ -33,8 +33,8 @@ import sys
 from os.path import abspath, dirname
 # enabling modules discovery from global entrypoint
 sys.path.append(abspath(dirname(__file__)+'/../'))
-from common.layers import ConvNorm, LinearNorm
-from common.utils import to_gpu, get_mask_from_lengths
+from tacotron2_common.layers import ConvNorm, LinearNorm
+from tacotron2_common.utils import to_gpu, get_mask_from_lengths
 
 
 class LocationLayer(nn.Module):
@@ -535,6 +535,7 @@ class Decoder(nn.Module):
          attention_weights_cum,
          attention_context,
          processed_memory) = self.initialize_decoder_states(memory)
+
         mel_lengths = torch.zeros([memory.size(0)], dtype=torch.int32, device=memory.device)
         not_finished = torch.ones([memory.size(0)], dtype=torch.int32, device=memory.device)
 

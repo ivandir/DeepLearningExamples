@@ -25,7 +25,8 @@ import tf_metrics
 
 import time
 import horovod.tensorflow as hvd
-from utils.utils import LogEvalRunHook, LogTrainRunHook
+from utils.utils import LogEvalRunHook, LogTrainRunHook, setup_xla_flags
+from utils.gpu_affinity import set_affinity
 import utils.dllogger_class
 from dllogger import Verbosity
 
@@ -124,8 +125,8 @@ flags.DEFINE_integer(
 tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 
 flags.DEFINE_bool("horovod", False, "Whether to use Horovod for multi-gpu runs")
-flags.DEFINE_bool("use_fp16", False, "Whether to use fp32 or fp16 arithmetic on GPU.")
-flags.DEFINE_bool("use_xla", False, "Whether to enable XLA JIT compilation.")
+flags.DEFINE_bool("amp", True, "Whether to enable AMP ops. When false, uses TF32 on A100 and FP32 on V100 GPUS.")
+flags.DEFINE_bool("use_xla", True, "Whether to enable XLA JIT compilation.")
 
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
@@ -272,7 +273,7 @@ class CLEFEProcessor(DataProcessor):
 
     @classmethod
     def _read_data2(cls, input_file):
-        with tf.io.gfile.Open(input_file, "r") as f:
+        with tf.io.gfile.GFile(input_file, "r") as f:
             lines = []
             words = []
             labels = []
@@ -306,10 +307,10 @@ class I2b22012Processor(CLEFEProcessor):
 def write_tokens(tokens, labels, mode):
     if mode == "test":
         path = os.path.join(FLAGS.output_dir, "token_" + mode + ".txt")
-        if tf.io.gfile.Exists(path):
-            wf = tf.io.gfile.Open(path, 'a')
+        if tf.io.gfile.exists(path):
+            wf = tf.io.gfile.GFile(path, 'a')
         else:
-            wf = tf.io.gfile.Open(path, 'w')
+            wf = tf.io.gfile.GFile(path, 'w')
         for token, label in zip(tokens, labels):
             if token != "**NULL**":
                 wf.write(token + ' ' + str(label) + '\n')
@@ -501,7 +502,7 @@ def create_model(bert_config, is_training, input_ids, input_mask,
 
 def model_fn_builder(bert_config, num_labels, init_checkpoint=None, learning_rate=None,
                      num_train_steps=None, num_warmup_steps=None,
-                     use_one_hot_embeddings=False, hvd=None, use_fp16=False):
+                     use_one_hot_embeddings=False, hvd=None, amp=False):
     def model_fn(features, labels, mode, params):
         tf.compat.v1.logging.info("*** Features ***")
         for name in sorted(features.keys()):
@@ -536,12 +537,18 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint=None, learning_rat
         output_spec = None
         if mode == tf.estimator.ModeKeys.TRAIN:
             train_op = optimization.create_optimizer(
-                total_loss, learning_rate, num_train_steps, num_warmup_steps, hvd, False, use_fp16)
+                total_loss, learning_rate, num_train_steps, num_warmup_steps, hvd, False, amp)
             output_spec = tf.estimator.EstimatorSpec(
               mode=mode,
               loss=total_loss,
               train_op=train_op)
         elif mode == tf.estimator.ModeKeys.EVAL:
+            dummy_op = tf.no_op()
+            # Need to call mixed precision graph rewrite if fp16 to enable graph rewrite
+            if amp:
+                loss_scaler = tf.train.experimental.FixedLossScale(1)
+                dummy_op = tf.train.experimental.enable_mixed_precision_graph_rewrite(
+                    optimization.LAMBOptimizer(learning_rate=0.0), loss_scaler)
 
             def metric_fn(per_example_loss, label_ids, logits):
                 # def metric_fn(label_ids, logits):
@@ -562,6 +569,13 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint=None, learning_rat
               loss=total_loss,
               eval_metric_ops=eval_metric_ops)
         else:
+
+            dummy_op = tf.no_op()
+            # Need to call mixed precision graph rewrite if fp16 to enable graph rewrite
+            if amp:
+                dummy_op = tf.train.experimental.enable_mixed_precision_graph_rewrite(
+                    optimization.LAMBOptimizer(learning_rate=0.0))
+
             output_spec = tf.estimator.EstimatorSpec(
               mode=mode, predictions=predicts)#probabilities)
         return output_spec
@@ -613,7 +627,7 @@ def result_to_pair(predict_line, pred_ids, id2label, writer, err_writer):
 
 
 def main(_):
-    os.environ["TF_XLA_FLAGS"] = "--tf_xla_enable_lazy_compilation=false" #causes memory fragmentation for bert leading to OOM
+    setup_xla_flags()
 
     tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
     dllogging = utils.dllogger_class.dllogger_class(FLAGS.dllog_path)
@@ -663,11 +677,14 @@ def main(_):
       master_process = (hvd.rank() == 0)
       hvd_rank = hvd.rank()
       config.gpu_options.visible_device_list = str(hvd.local_rank())
+      set_affinity(hvd.local_rank())
       if hvd.size() > 1:
         training_hooks.append(hvd.BroadcastGlobalVariablesHook(0))
 
     if FLAGS.use_xla:
         config.graph_options.optimizer_options.global_jit_level = tf.compat.v1.OptimizerOptions.ON_1
+        if FLAGS.amp:
+            tf.enable_resource_variables()
     run_config = tf.estimator.RunConfig(
       model_dir=FLAGS.output_dir if master_process else None,
       session_config=config,
@@ -715,7 +732,7 @@ def main(_):
         num_warmup_steps=num_warmup_steps,
         use_one_hot_embeddings=False,
         hvd=None if not FLAGS.horovod else hvd,
-        use_fp16=FLAGS.use_fp16)
+        amp=FLAGS.amp)
 
     estimator = tf.estimator.Estimator(
       model_fn=model_fn,
@@ -777,11 +794,11 @@ def main(_):
             drop_remainder=eval_drop_remainder)
         result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
         output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-        with tf.io.gfile.Open(output_eval_file, "w") as writer:
+        with tf.io.gfile.GFile(output_eval_file, "w") as writer:
             tf.compat.v1.logging.info("***** Eval results *****")
             for key in sorted(result.keys()):
                 tf.compat.v1.logging.info("  %s = %s", key, str(result[key]))
-                dllogging.logger.log(step=(), data={key: float(strresult[key])}, verbosity=Verbosity.DEFAULT)
+                dllogging.logger.log(step=(), data={key: float(str(result[key]))}, verbosity=Verbosity.DEFAULT)
                 writer.write("%s = %s\n" % (key, str(result[key])))
     if FLAGS.do_predict and master_process:
         predict_examples = processor.get_test_examples(FLAGS.data_dir)
@@ -790,12 +807,12 @@ def main(_):
                                                  FLAGS.max_seq_length, tokenizer,
                                                  predict_file, mode="test")
 
-        with tf.io.gfile.Open(os.path.join(FLAGS.output_dir, 'label2id.pkl'), 'rb') as rf:
+        with tf.io.gfile.GFile(os.path.join(FLAGS.output_dir, 'label2id.pkl'), 'rb') as rf:
             label2id = pickle.load(rf)
             id2label = {value: key for key, value in label2id.items()}
         token_path = os.path.join(FLAGS.output_dir, "token_test.txt")
-        if tf.io.gfile.Exists(token_path):
-            tf.io.gfile.Remove(token_path)
+        if tf.io.gfile.exists(token_path):
+            tf.io.gfile.remove(token_path)
 
         tf.compat.v1.logging.info("***** Running prediction*****")
         tf.compat.v1.logging.info("  Num examples = %d", len(predict_examples))
@@ -815,9 +832,9 @@ def main(_):
         output_predict_file = os.path.join(FLAGS.output_dir, "label_test.txt")
         test_labels_file = os.path.join(FLAGS.output_dir, "test_labels.txt")
         test_labels_err_file = os.path.join(FLAGS.output_dir, "test_labels_errs.txt")
-        with tf.io.gfile.Open(output_predict_file, 'w') as writer, \
-                tf.io.gfile.Open(test_labels_file, 'w') as tl, \
-                tf.io.gfile.Open(test_labels_err_file, 'w') as tle:
+        with tf.io.gfile.GFile(output_predict_file, 'w') as writer, \
+                tf.io.gfile.GFile(test_labels_file, 'w') as tl, \
+                tf.io.gfile.GFile(test_labels_err_file, 'w') as tle:
             print(id2label)
             i=0
             for prediction in estimator.predict(input_fn=predict_input_fn, hooks=eval_hooks,
@@ -851,7 +868,7 @@ def main(_):
         tf.compat.v1.logging.info("Summary Inference Statistics")
         tf.compat.v1.logging.info("Batch size = %d", FLAGS.predict_batch_size)
         tf.compat.v1.logging.info("Sequence Length = %d", FLAGS.max_seq_length)
-        tf.compat.v1.logging.info("Precision = %s", "fp16" if FLAGS.use_fp16 else "fp32")
+        tf.compat.v1.logging.info("Precision = %s", "fp16" if FLAGS.amp else "fp32")
         tf.compat.v1.logging.info("Latency Confidence Level 50 (ms) = %0.2f", cf_50 * 1000)
         tf.compat.v1.logging.info("Latency Confidence Level 90 (ms) = %0.2f", cf_90 * 1000)
         tf.compat.v1.logging.info("Latency Confidence Level 95 (ms) = %0.2f", cf_95 * 1000)
@@ -863,11 +880,11 @@ def main(_):
         tf.compat.v1.logging.info("-----------------------------")
 
         tf.compat.v1.logging.info('Reading: %s', test_labels_file)
-        with tf.io.gfile.Open(test_labels_file, "r") as f:
+        with tf.io.gfile.GFile(test_labels_file, "r") as f:
             counts = evaluate(f)
         eval_result = report_notprint(counts)
         print(''.join(eval_result))
-        with tf.io.gfile.Open(os.path.join(FLAGS.output_dir, 'test_results_conlleval.txt'), 'w') as fd:
+        with tf.io.gfile.GFile(os.path.join(FLAGS.output_dir, 'test_results_conlleval.txt'), 'w') as fd:
             fd.write(''.join(eval_result))
 
 

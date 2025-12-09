@@ -1,4 +1,4 @@
-# Copyright (c) 2020 NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2021 NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,16 +13,16 @@
 # limitations under the License.
 
 
-from collections import defaultdict, deque
-import datetime
+import errno
+import os
 import time
+from collections import defaultdict, deque
+
+import dllogger
 import torch
 import torch.distributed as dist
 
-import errno
-import os
-
-import dllogger
+from dlrm.utils.distributed import is_dist_avail_and_initialized
 
 
 class SmoothedValue(object):
@@ -59,7 +59,7 @@ class SmoothedValue(object):
     @property
     def median(self):
         d = torch.tensor(list(self.deque))
-        return d.median().item()
+        return d.median().item() if len(self.deque) else 0
 
     @property
     def avg(self):
@@ -68,15 +68,15 @@ class SmoothedValue(object):
 
     @property
     def global_avg(self):
-        return self.total / self.count
+        return self.total / self.count if self.count else 0
 
     @property
     def max(self):
-        return max(self.deque)
+        return max(self.deque) if len(self.deque) else 0
 
     @property
     def value(self):
-        return self.deque[-1]
+        return self.deque[-1] if len(self.deque) else None
 
     def __str__(self):
         return self.fmt.format(
@@ -127,7 +127,7 @@ class MetricLogger(object):
             header = ''
         print_str = header
         for name, meter in self.meters.items():
-            print_str += F"  {name}: {meter}"
+            print_str += f"  {name}: {meter}"
         print(print_str)
 
 
@@ -172,52 +172,12 @@ def lr_step(optim, num_warmup_iter, current_step, base_lr, warmup_factor, decay_
         param_group['lr'] = new_lr
 
 
-
 def mkdir(path):
     try:
         os.makedirs(path)
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
-
-
-def setup_for_distributed(is_master):
-    """
-    This function disables printing when not in master process
-    """
-    import builtins as __builtin__
-    builtin_print = __builtin__.print
-
-    def print(*args, **kwargs):
-        force = kwargs.pop('force', False)
-        if is_master or force:
-            builtin_print(*args, **kwargs)
-
-    __builtin__.print = print
-
-
-def is_dist_avail_and_initialized():
-    if not dist.is_available():
-        return False
-    if not dist.is_initialized():
-        return False
-    return True
-
-
-def get_world_size():
-    if not is_dist_avail_and_initialized():
-        return 1
-    return dist.get_world_size()
-
-
-def get_rank():
-    if not is_dist_avail_and_initialized():
-        return 0
-    return dist.get_rank()
-
-
-def is_main_process():
-    return get_rank() == 0
 
 
 def init_logging(log_path):
@@ -229,39 +189,19 @@ def init_logging(log_path):
     stdout_backend._metadata['best_epoch'].update({'format': '0:.2f'})
     stdout_backend._metadata['average_train_throughput'].update({'format': ':.2e'})
     stdout_backend._metadata['average_test_throughput'].update({'format': ':.2e'})
+    stdout_backend._metadata['training_loss'].update({'format': '0:.5f'})
+    stdout_backend._metadata['best_validation_loss'].update({'format': '0:.5f'})
 
     dllogger.init(backends=[json_backend, stdout_backend])
 
-
-def save_on_master(*args, **kwargs):
-    if is_main_process():
-        torch.save(*args, **kwargs)
-
-
-def init_distributed_mode(args):
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ['WORLD_SIZE'])
-        args.gpu = int(os.environ['LOCAL_RANK'])
-    elif 'SLURM_PROCID' in os.environ:
-        args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
-    elif hasattr(args, "rank"):
-        pass
-    else:
-        print('Not using distributed mode')
-        args.distributed = False
-        return
-
-    args.distributed = True
-
-    torch.cuda.set_device(args.gpu)
-    args.dist_backend = 'nccl'
-    print('| distributed init (rank {}): {}'.format(
-        args.rank, args.dist_url), flush=True)
-    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                         world_size=args.world_size, rank=args.rank)
-    setup_for_distributed(args.rank == 0)
+    dllogger.metadata("best_auc", {"unit": None})
+    dllogger.metadata("mean_inference_latency_batch_1", {"unit": "s"})
+    dllogger.metadata("mean_inference_latency_batch_64", {"unit": "s"})
+    dllogger.metadata("mean_inference_latency_batch_4096", {"unit": "s"})
+    dllogger.metadata("average_train_throughput", {"unit": "samples/s"})
+    dllogger.metadata("mean_inference_throughput_batch_1", {"unit": "samples/s"})
+    dllogger.metadata("mean_inference_throughput_batch_64", {"unit": "samples/s"})
+    dllogger.metadata("mean_inference_throughput_batch_4096", {"unit": "samples/s"})
 
 
 class StepTimer():
@@ -270,9 +210,111 @@ class StepTimer():
         self._new = None
         self.measured = None
 
-    def click(self):
+    def click(self, synchronize=False):
         self._previous = self._new
+
+        if synchronize:
+            torch.cuda.synchronize()
         self._new = time.time()
 
         if self._previous is not None:
             self.measured = self._new - self._previous
+
+
+class LearningRateScheduler:
+    """Polynomial learning rate decay for multiple optimizers and multiple param groups
+
+    Args:
+        optimizers (list): optimizers for which to apply the learning rate changes
+        base_lrs (list): a nested list of base_lrs to use for each param_group of each optimizer
+        warmup_steps (int): number of linear warmup steps to perform at the beginning of training
+        warmup_factor (int)
+        decay_steps (int): number of steps over which to apply poly LR decay from base_lr to 0
+        decay_start_step (int): the optimization step at which to start decaying the learning rate
+            if None will start the decay immediately after
+        decay_power (float): polynomial learning rate decay power
+        end_lr_factor (float): for each optimizer and param group:
+            lr = max(current_lr_factor, end_lr_factor) * base_lr
+
+    Example:
+        lr_scheduler = LearningRateScheduler(optimizers=[optimizer], base_lrs=[[lr]],
+                                             warmup_steps=100, warmup_factor=0,
+                                             decay_start_step=1000, decay_steps=2000,
+                                             decay_power=2, end_lr_factor=1e-6)
+
+        for batch in data_loader:
+            lr_scheduler.step()
+            # foward, backward, weight update
+    """
+
+    def __init__(self, optimizers, base_lrs, warmup_steps, warmup_factor,
+                 decay_steps, decay_start_step, decay_power=2, end_lr_factor=0):
+        self.current_step = 0
+        self.optimizers = optimizers
+        self.base_lrs = base_lrs
+        self.warmup_steps = warmup_steps
+        self.warmup_factor = warmup_factor
+        self.decay_steps = decay_steps
+        self.decay_start_step = decay_start_step
+        self.decay_power = decay_power
+        self.end_lr_factor = end_lr_factor
+        self.decay_end_step = self.decay_start_step + self.decay_steps
+
+        if self.decay_start_step < self.warmup_steps:
+            raise ValueError('Learning rate warmup must finish before decay starts')
+
+    def _compute_lr_factor(self):
+        lr_factor = 1
+
+        if self.current_step <= self.warmup_steps:
+            warmup_step = 1 / (self.warmup_steps * (2 ** self.warmup_factor))
+            lr_factor = 1 - (self.warmup_steps - self.current_step) * warmup_step
+        elif self.decay_start_step < self.current_step <= self.decay_end_step:
+            lr_factor = ((self.decay_end_step - self.current_step) / self.decay_steps) ** self.decay_power
+            lr_factor = max(lr_factor, self.end_lr_factor)
+        elif self.current_step > self.decay_end_step:
+            lr_factor = self.end_lr_factor
+
+        return lr_factor
+
+    def step(self):
+        self.current_step += 1
+        lr_factor = self._compute_lr_factor()
+
+        for optim, base_lrs in zip(self.optimizers, self.base_lrs):
+            for group_id, base_lr in enumerate(base_lrs):
+                optim.param_groups[group_id]['lr'] = base_lr * lr_factor
+
+
+def roc_auc_score(y_true, y_score):
+    """ROC AUC score in PyTorch
+
+    Args:
+        y_true (Tensor):
+        y_score (Tensor):
+    """
+    device = y_true.device
+    y_true.squeeze_()
+    y_score.squeeze_()
+    if y_true.shape != y_score.shape:
+        raise TypeError(f"Shape of y_true and y_score must match. Got {y_true.shape()} and {y_score.shape()}.")
+
+    desc_score_indices = torch.argsort(y_score, descending=True)
+    y_score = y_score[desc_score_indices]
+    y_true = y_true[desc_score_indices]
+
+    distinct_value_indices = torch.nonzero(y_score[1:] - y_score[:-1], as_tuple=False).squeeze()
+    threshold_idxs = torch.cat([distinct_value_indices, torch.tensor([y_true.numel() - 1], device=device)])
+
+    tps = torch.cumsum(y_true, dim=0)[threshold_idxs]
+    fps = 1 + threshold_idxs - tps
+
+    tps = torch.cat([torch.zeros(1, device=device), tps])
+    fps = torch.cat([torch.zeros(1, device=device), fps])
+
+    fpr = fps / fps[-1]
+    tpr = tps / tps[-1]
+
+    area = torch.trapz(tpr, fpr).item()
+
+    return area

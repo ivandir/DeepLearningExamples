@@ -25,13 +25,11 @@
 #
 # *****************************************************************************
 
-import random
-import numpy as np
 import torch
 import torch.utils.data
 
-import common.layers as layers
-from common.utils import load_wav_to_torch, load_filepaths_and_text, to_gpu
+import tacotron2_common.layers as layers
+from tacotron2_common.utils import load_wav_to_torch, load_filepaths_and_text, to_gpu
 from tacotron2.text import text_to_sequence
 
 class TextMelLoader(torch.utils.data.Dataset):
@@ -50,8 +48,6 @@ class TextMelLoader(torch.utils.data.Dataset):
             args.filter_length, args.hop_length, args.win_length,
             args.n_mel_channels, args.sampling_rate, args.mel_fmin,
             args.mel_fmax)
-        random.seed(1234)
-        random.shuffle(self.audiopaths_and_text)
 
     def get_mel_text_pair(self, audiopath_and_text):
         # separate filename and text

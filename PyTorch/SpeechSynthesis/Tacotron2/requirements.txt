@@ -3,5 +3,5 @@ numpy
 inflect
 librosa
 scipy
-Unidecode
-git+git://github.com/NVIDIA/dllogger.git@26a0f8f1958de2c0c460925ff6102a4d2486d6cc#egg=dllogger
+resampy==0.3.1
+git+https://github.com/NVIDIA/dllogger@v0.1.0#egg=dllogger

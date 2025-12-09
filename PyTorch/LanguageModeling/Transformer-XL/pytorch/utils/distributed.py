@@ -1,4 +1,4 @@
-# Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2019-2020, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,10 +37,13 @@ def init_distributed(cuda):
 
 def barrier():
     """
-    Call torch.distributed.barrier() if distritubed is in use
+    Call torch.distributed.barrier() if distritubed is in use, else calls
+    torch.cuda.synchronize() if CUDA is initialized.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
+    elif torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.synchronize()
 
 
 def get_rank():
@@ -98,6 +101,17 @@ def all_reduce_item(value, op='sum'):
     else:
         ret = value
     return ret
+
+
+def all_gather_tensors(tensor, device):
+    tensor = tensor.to(device)
+    world_size = get_world_size()
+    if world_size == 1:
+        tensors = [tensor]
+    else:
+        tensors = [torch.empty_like(tensor) for _ in range(world_size)]
+        torch.distributed.all_gather(tensors, tensor)
+    return tensors
 
 
 @contextmanager

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <THC/THC.h>
-#include <THC/THCDeviceUtils.cuh>
 #include <torch/torch.h>
 #include <vector>
 #include <iostream>
@@ -83,12 +82,12 @@ std::vector<at::Tensor> box_encode_cuda(at::Tensor boxes, at::Tensor anchors, fl
     dim3 blockDim(blockSize);
     int idxJump = minGridSize * blockSize;
     auto stream = at::cuda::getCurrentCUDAStream();
-    box_encode_kernel<<<gridDim,blockDim,0,stream.stream()>>>(targets_dx.data<float>(), 
-                                                              targets_dy.data<float>(), 
-                                                              targets_dw.data<float>(), 
-                                                              targets_dh.data<float>(), 
-                                                              (float4*) boxes.data<float>(), 
-                                                              (float4*) anchors.data<float>(), 
+    box_encode_kernel<<<gridDim,blockDim,0,stream.stream()>>>(targets_dx.data_ptr<float>(), 
+                                                              targets_dy.data_ptr<float>(), 
+                                                              targets_dw.data_ptr<float>(), 
+                                                              targets_dh.data_ptr<float>(), 
+                                                              (float4*) boxes.data_ptr<float>(), 
+                                                              (float4*) anchors.data_ptr<float>(), 
                                                               wx, wy, ww, wh, 
                                                               size, idxJump);
      

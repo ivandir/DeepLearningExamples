@@ -340,27 +340,21 @@ class VAE:
         # Therefore we're using the nan-aware mean from numpy to ignore users with no items to be predicted. 
         return {name: np.nanmean(scores) for name, scores in metrics_scores.items()}
 
-    def query(self, input_data: np.ndarray):
+    def query(self, indices: np.ndarray):
         """
         inference for batch size 1
 
         :param input_data:
         :return:
         """
-        query_start = time.time()
-        indices = np.stack([np.zeros(len(input_data)), input_data], axis=1)
-        values = np.ones(shape=(1, len(input_data)))
+        values = np.ones(shape=(1, len(indices)))
         values = normalize(values)
         values = values.reshape(-1)
 
-        sess_run_start = time.time()
         res = self.session.run(
             self.top_k_query,
             feed_dict={self.inputs_query: (indices,
                                            values)})
-        query_end_time = time.time()
-        LOG.info('query time: {}'.format(query_end_time - query_start))
-        LOG.info('sess run time: {}'.format(query_end_time - sess_run_start))
         return res
 
     def _increment_global_step(self):
@@ -419,15 +413,8 @@ class VAE:
         dllogger.log(data=metrics_scores, step=(epoch,))
 
     def log_final_stats(self):
-        data = {"total_train_time": np.sum(self.time_elapsed_training_history),
-                "total_valid_time": np.sum(self.time_elapsed_validation_history),
-                "average_train_epoch time": np.mean(self.time_elapsed_training_history),
-                "average_validation_time": np.mean(self.time_elapsed_validation_history),
-                "total_elapsed_time" : self.total_time,
-                "mean_training_throughput": np.mean(self.training_throughputs[10:]),
-                "mean_inference_throughput": np.mean(self.inference_throughputs),
-                "max_training_throughput": np.max(self.training_throughputs[10:]),
-                "max_inference_throughput": np.max(self.inference_throughputs)}
+        data = {"mean_training_throughput": np.mean(self.training_throughputs[10:]),
+                "mean_inference_throughput": np.mean(self.inference_throughputs[2:])}
 
         for metric_name, metric_values in self.metrics_history.items():
             data["final_" + metric_name] = metric_values[-1]

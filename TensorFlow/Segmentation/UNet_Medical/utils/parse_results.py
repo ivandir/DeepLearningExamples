@@ -1,4 +1,4 @@
-# Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,19 +17,22 @@ import numpy as np
 import argparse
 
 
-def process_performance_stats(timestamps, batch_size):
+def process_performance_stats(timestamps, batch_size, mode):
+    """ Get confidence intervals
+
+    :param timestamps: Collection of timestamps
+    :param batch_size: Number of samples per batch
+    :param mode: Estimator's execution mode
+    :return: Stats
+    """
     timestamps_ms = 1000 * timestamps
-    timestamps_ms = timestamps_ms[timestamps_ms > 0]
-    latency_ms = timestamps_ms.mean()
-    std = timestamps_ms.std()
-    n = np.sqrt(len(timestamps_ms))
     throughput_imgps = (1000.0 * batch_size / timestamps_ms).mean()
-    print('Throughput Avg:', round(throughput_imgps, 3), 'img/s')
-    print('Latency Avg:', round(latency_ms, 3), 'ms')
-    for ci, lvl in zip(["90%:", "95%:", "99%:"],
-                       [1.645, 1.960, 2.576]):
-        print("Latency", ci, round(latency_ms + lvl * std / n, 3), "ms")
-    return float(throughput_imgps), float(latency_ms)
+    stats = {f"throughput_{mode}": throughput_imgps,
+             f"latency_{mode}_mean": timestamps_ms.mean()}
+    for level in [90, 95, 99]:
+        stats.update({f"latency_{mode}_{level}": np.percentile(timestamps_ms, level)})
+
+    return stats
 
 
 def parse_convergence_results(path, environment):
@@ -40,14 +43,14 @@ def parse_convergence_results(path, environment):
         raise FileNotFoundError("No logfile found at {}".format(path))
     for logfile in logfiles:
         with open(os.path.join(path, logfile), "r") as f:
-            content = f.readlines()
-        if "eval_dice_score" not in content[-1]:
+            content = f.readlines()[-1]
+        if "eval_dice_score" not in content:
             print("Evaluation score not found. The file", logfile, "might be corrupted.")
             continue
-        dice_scores.append(float([val for val in content[-1].split()
-                                  if "eval_dice_score" in val][0].split(":")[1]))
-        ce_scores.append(float([val for val in content[-1].split()
-                                if "eval_ce_loss" in val][0].split(":")[1]))
+        dice_scores.append(float([val for val in content.split("  ")
+                                  if "eval_dice_score" in val][0].split()[-1]))
+        ce_scores.append(float([val for val in content.split("  ")
+                                if "eval_ce_loss" in val][0].split()[-1]))
     if dice_scores:
         print("Evaluation dice score:", sum(dice_scores) / len(dice_scores))
         print("Evaluation cross-entropy loss:", sum(ce_scores) / len(ce_scores))
@@ -77,4 +80,3 @@ if __name__ == '__main__':
         parse_convergence_results(path=args.model_dir, environment=args.env)
     elif args.exec_mode == 'benchmark':
         pass
-    print()

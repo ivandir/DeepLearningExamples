@@ -1,1 +1,4 @@
--e git://github.com/NVIDIA/dllogger#egg=dllogger
+git+https://github.com/NVIDIA/dllogger#egg=dllogger
+mpi4py
+sklearn
+pandas

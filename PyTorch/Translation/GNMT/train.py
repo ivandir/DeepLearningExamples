@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (c) 2017 Elad Hoffer
-# Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -21,19 +21,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+
+os.environ['KMP_AFFINITY'] = 'disabled'
+
 import argparse
 import logging
-import os
 import sys
 import time
 from ast import literal_eval
 
+import dllogger
 import torch.nn as nn
 import torch.nn.parallel
 import torch.optim
 import torch.utils.data.distributed
 
 import seq2seq.data.config as config
+import seq2seq.gpu_affinity as gpu_affinity
 import seq2seq.train.trainer as trainers
 import seq2seq.utils as utils
 from seq2seq.data.dataset import LazyParallelDataset
@@ -113,14 +118,14 @@ def parse_args():
 
     # results
     results = parser.add_argument_group('results setup')
-    results.add_argument('--results-dir', default='results',
+    results.add_argument('--save-dir', default='gnmt',
                          help='path to directory with results, it will be \
                          automatically created if it does not exist')
-    results.add_argument('--save-dir', default='gnmt',
-                         help='defines subdirectory within RESULTS_DIR for \
-                         results from this training run')
     results.add_argument('--print-freq', default=10, type=int,
                          help='print log every PRINT_FREQ batches')
+    results.add_argument('--warmup', default=1, type=int,
+                         help='number of warmup iterations for performance \
+                         counters')
 
     # model
     model = parser.add_argument_group('model setup')
@@ -142,7 +147,7 @@ def parse_args():
     # setup
     general = parser.add_argument_group('general setup')
     general.add_argument('--math', default='fp16',
-                         choices=['fp16', 'fp32', 'manual_fp16'],
+                         choices=['fp16', 'fp32', 'tf32', 'manual_fp16'],
                          help='precision')
     general.add_argument('--seed', default=None, type=int,
                          help='master seed for random number generators, if \
@@ -151,6 +156,15 @@ def parse_args():
     general.add_argument('--prealloc-mode', default='always', type=str,
                          choices=['off', 'once', 'always'],
                          help='controls preallocation')
+    general.add_argument('--dllog-file', type=str, default='train_log.json',
+                         help='Name of the DLLogger output file')
+    general.add_argument('--affinity', type=str,
+                         default='socket_unique_interleaved',
+                         choices=['socket', 'single', 'single_unique',
+                                  'socket_unique_interleaved',
+                                  'socket_unique_continuous',
+                                  'disabled'],
+                         help='type of CPU affinity')
 
     exclusive_group(group=general, name='eval', default=True,
                     help='run validation and test after every epoch')
@@ -304,16 +318,14 @@ def parse_args():
 
     # distributed
     distributed = parser.add_argument_group('distributed setup')
-    distributed.add_argument('--rank', default=0, type=int,
-                             help='global rank of the process, do not set!')
-    distributed.add_argument('--local_rank', default=0, type=int,
-                             help='local rank of the process, do not set!')
+    distributed.add_argument('--local_rank',  type=int,
+                             default=os.getenv('LOCAL_RANK', 0),
+                             help='Used for multi-process training.')
 
     args = parser.parse_args()
 
     args.lang = {'src': args.src_lang, 'tgt': args.tgt_lang}
 
-    args.save_dir = os.path.join(args.results_dir, args.save_dir)
     args.vocab = os.path.join(args.dataset_dir, args.vocab)
     args.bpe_codes = os.path.join(args.dataset_dir, args.bpe_codes)
     args.train_src = os.path.join(args.dataset_dir, args.train_src)
@@ -366,6 +378,14 @@ def main():
     """
     training_start = time.time()
     args = parse_args()
+    if args.affinity != 'disabled':
+        nproc_per_node = torch.cuda.device_count()
+        affinity = gpu_affinity.set_affinity(
+            args.local_rank,
+            nproc_per_node,
+            args.affinity
+        )
+        print(f'{args.local_rank}: thread affinity: {affinity}')
     device = utils.set_device(args.cuda, args.local_rank)
     utils.init_distributed(args.cuda)
     args.rank = utils.get_rank()
@@ -381,11 +401,15 @@ def main():
     utils.setup_logging(args.log_all_ranks,
                         os.path.join(args.save_dir, log_filename))
 
+    dllog_file = os.path.join(args.save_dir, args.dllog_file)
+    utils.setup_dllogger(enabled=True, filename=dllog_file)
+
     if args.env:
         utils.log_env_info()
 
     logging.info(f'Saving results to: {args.save_dir}')
     logging.info(f'Run arguments: {args}')
+    dllogger.log(step='PARAMETER', data=vars(args))
 
     args.train_iter_size = set_iter_size(args.train_iter_size,
                                          args.train_global_batch_size,
@@ -527,6 +551,7 @@ def main():
         intra_epoch_eval=args.intra_epoch_eval,
         translator=translator,
         prealloc_mode=args.prealloc_mode,
+        warmup=args.warmup,
         )
 
     trainer = trainers.Seq2SeqTrainer(**trainer_options)
@@ -542,6 +567,8 @@ def main():
             logging.error(f'No checkpoint found at {args.resume}')
 
     # training loop
+    train_loss = float('inf')
+    val_loss = float('inf')
     best_loss = float('inf')
     training_perf = []
     break_training = False
@@ -607,11 +634,20 @@ def main():
     logging.info(f'Total training time {training_time:.0f} s')
 
     table = TrainingTable()
-    avg_training_perf = sum(training_perf) / len(training_perf)
+    avg_training_perf = len(training_perf) / sum(1 / v for v in training_perf)
     table.add(utils.get_world_size(), args.train_batch_size, test_bleu,
               avg_training_perf, training_time)
     if utils.get_rank() == 0:
         table.write('Training Summary', args.math)
+
+    summary = {
+        'val_loss': val_loss,
+        'train_loss': train_loss,
+        'train_throughput': avg_training_perf,
+        'train_elapsed': training_time,
+        'test_bleu': test_bleu,
+        }
+    dllogger.log(step=tuple(), data=summary)
 
     passed = utils.benchmark(test_bleu, args.target_bleu,
                              train_perf, args.target_perf)

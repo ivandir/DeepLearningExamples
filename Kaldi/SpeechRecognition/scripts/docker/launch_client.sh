@@ -19,4 +19,5 @@ docker run --rm -it \
     --ulimit memlock=-1 \
     --ulimit stack=67108864 \
     -v $PWD/data:/data \
-    trtis_kaldi_client install/bin/kaldi_asr_parallel_client $@
+    --entrypoint /bin/bash \
+    triton_kaldi_client /workspace/scripts/docker/run_client.sh $@

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2019-2021 NVIDIA CORPORATION. All rights reserved.
 # Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import os
 import random
 import sys
 from io import open
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -37,7 +38,7 @@ from tqdm import tqdm, trange
 from apex import amp
 from schedulers import LinearWarmUpScheduler
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from modeling import BertForQuestionAnswering, BertConfig, WEIGHTS_NAME, CONFIG_NAME
+import modeling
 from optimization import BertAdam, warmup_linear
 from tokenization import (BasicTokenizer, BertTokenizer, whitespace_tokenize)
 from utils import is_main_process, format_step
@@ -472,11 +473,11 @@ def get_answers(examples, features, results, args):
                 preds,
                 key=lambda x: (x.start_logit + x.end_logit),
                 reverse=True)[:args.n_best_size]
-        
+
         # In very rare edge cases we could only have single null prediction.
-	      # So we just create a nonce prediction in this case to avoid failure.
-        if not nbest:                                                    
-	          nbest.append(Prediction(text="empty", start_logit=0.0, end_logit=0.0))
+        # So we just create a nonce prediction in this case to avoid failure.
+        if not nbest:
+            nbest.append(Prediction(text="empty", start_logit=0.0, end_logit=0.0))
 
         total_scores = []
         best_non_null_entry = None
@@ -523,7 +524,7 @@ def get_answer_text(example, feature, pred, args):
     return final_text
 
 def get_valid_prelim_predictions(start_indices, end_indices, feature, result, args):
-    
+
     _PrelimPrediction = collections.namedtuple(
         "PrelimPrediction",
         ["start_index", "end_index", "start_logit", "end_logit"])
@@ -701,7 +702,7 @@ def _compute_softmax(scores):
 from apex.multi_tensor_apply import multi_tensor_applier
 class GradientClipper:
     """
-    Clips gradient norm of an iterable of parameters. 
+    Clips gradient norm of an iterable of parameters.
     """
     def __init__(self, max_grad_norm):
         self.max_norm = max_grad_norm
@@ -788,11 +789,16 @@ def main():
                         help="Whether to lower case the input text. True for uncased models, False for cased models.")
     parser.add_argument("--local_rank",
                         type=int,
-                        default=-1,
+                        default=os.getenv('LOCAL_RANK', -1),
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--fp16',
+                        default=False,
                         action='store_true',
-                        help="Whether to use 16-bit float precision instead of 32-bit")
+                        help="Mixed precision training")
+    parser.add_argument('--amp',
+                        default=False,
+                        action='store_true',
+                        help="Mixed precision training")
     parser.add_argument('--loss_scale',
                         type=float, default=0,
                         help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
@@ -844,11 +850,13 @@ def main():
                         default=None,
                         type=str,
                         help="Location to cache train feaures. Will default to the dataset directory")
+    parser.add_argument("--profile",
+                        default=False,
+                        action='store_true',
+                        help="Whether to profile model.")
 
     args = parser.parse_args()
-
-    if args.use_env and 'LOCAL_RANK' in os.environ:
-        args.local_rank = int(os.environ['LOCAL_RANK'])
+    args.fp16 = args.fp16 or args.amp
 
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
@@ -861,12 +869,21 @@ def main():
         n_gpu = 1
 
     if is_main_process():
+        Path(os.path.dirname(args.json_summary)).mkdir(parents=True, exist_ok=True)
         dllogger.init(backends=[dllogger.JSONStreamBackend(verbosity=dllogger.Verbosity.VERBOSE,
                                                            filename=args.json_summary),
                                 dllogger.StdOutBackend(verbosity=dllogger.Verbosity.VERBOSE, step_format=format_step)])
     else:
         dllogger.init(backends=[])
-        
+    
+    dllogger.metadata("e2e_train_time", {"unit": "s"})
+    dllogger.metadata("training_sequences_per_second", {"unit": "sequences/s"})
+    dllogger.metadata("final_loss", {"unit": None})
+    dllogger.metadata("e2e_inference_time", {"unit": "s"})
+    dllogger.metadata("inference_sequences_per_second", {"unit": "sequences/s"})
+    dllogger.metadata("exact_match", {"unit": None})
+    dllogger.metadata("F1", {"unit": None})
+
     print("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
                                 device, n_gpu, bool(args.local_rank != -1), args.fp16))
 
@@ -917,16 +934,18 @@ def main():
             num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
     # Prepare model
-    config = BertConfig.from_json_file(args.config_file)
+    config = modeling.BertConfig.from_json_file(args.config_file)
     # Padding for divisibility by 8
     if config.vocab_size % 8 != 0:
         config.vocab_size += 8 - (config.vocab_size % 8)
 
-    model = BertForQuestionAnswering(config)
-    # model = BertForQuestionAnswering.from_pretrained(args.bert_model,
+    model = modeling.BertForQuestionAnswering(config)
+    # model = modeling.BertForQuestionAnswering.from_pretrained(args.bert_model,
                 # cache_dir=os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank)))
     dllogger.log(step="PARAMETER", data={"loading_checkpoint": True})
-    model.load_state_dict(torch.load(args.init_checkpoint, map_location='cpu')["model"], strict=False)
+    checkpoint = torch.load(args.init_checkpoint, map_location='cpu')
+    checkpoint = checkpoint["model"] if "model" in checkpoint.keys() else checkpoint
+    model.load_state_dict(checkpoint, strict=False)
     dllogger.log(step="PARAMETER", data={"loaded_checkpoint": True})
     model.to(device)
     num_weights = sum([p.numel() for p in model.parameters() if p.requires_grad])
@@ -1031,12 +1050,13 @@ def main():
         model.train()
         gradClipper = GradientClipper(max_grad_norm=1.0)
         final_loss = None
+
         train_start = time.time()
         for epoch in range(int(args.num_train_epochs)):
             train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
             for step, batch in enumerate(train_iter):
                 # Terminate early for benchmarking
-                
+
                 if args.max_steps > 0 and global_step > args.max_steps:
                     break
 
@@ -1067,10 +1087,10 @@ def main():
                         scaled_loss.backward()
                 else:
                     loss.backward()
-                
-                # gradient clipping  
-                gradClipper.step(amp.master_params(optimizer))         
- 
+
+                # gradient clipping
+                gradClipper.step(amp.master_params(optimizer))
+
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     if args.fp16 :
                         # modify learning rate with special warm up for BERT which FusedAdam doesn't do
@@ -1082,16 +1102,15 @@ def main():
                 final_loss = loss.item()
                 if step % args.log_freq == 0:
                     dllogger.log(step=(epoch, global_step,), data={"step_loss": final_loss,
-                                                                   "learning_rate": optimizer.param_groups[0]['lr']})
-
+                                                                "learning_rate": optimizer.param_groups[0]['lr']})
         time_to_train = time.time() - train_start
 
     if args.do_train and is_main_process() and not args.skip_checkpoint:
         # Save a trained model and the associated configuration
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
+        output_model_file = os.path.join(args.output_dir, modeling.WEIGHTS_NAME)
         torch.save({"model":model_to_save.state_dict()}, output_model_file)
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+        output_config_file = os.path.join(args.output_dir, modeling.CONFIG_NAME)
         with open(output_config_file, 'w') as f:
             f.write(model_to_save.config.to_json_string())
 
@@ -1142,8 +1161,8 @@ def main():
                 eval_feature = eval_features[example_index.item()]
                 unique_id = int(eval_feature.unique_id)
                 all_results.append(RawResult(unique_id=unique_id,
-                                             start_logits=start_logits,
-                                             end_logits=end_logits))
+                                            start_logits=start_logits,
+                                            end_logits=end_logits))
 
         time_to_infer = time.time() - infer_start
         output_prediction_file = os.path.join(args.output_dir, "predictions.json")

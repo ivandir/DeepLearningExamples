@@ -33,26 +33,19 @@ from contextlib import contextmanager
 
 import torch
 from torch.utils.data import DataLoader
-from torch.autograd import Variable
-from torch.nn.parameter import Parameter
 
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 
-from apex.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import models
 import loss_functions
 import data_functions
+from tacotron2_common.utils import ParseFromConfigFile
 
 import dllogger as DLLogger
 from dllogger import StdOutBackend, JSONStreamBackend, Verbosity
-
-from scipy.io.wavfile import write as write_wav
-
-from apex import amp
-amp.lists.functional_overrides.FP32_FUNCS.remove('softmax')
-amp.lists.functional_overrides.FP16_FUNCS.append('softmax')
 
 
 def parse_args(parser):
@@ -73,6 +66,11 @@ def parse_args(parser):
     parser.add_argument('--anneal-factor', type=float, choices=[0.1, 0.3], default=0.1,
                         help='Factor for annealing learning rate')
 
+    parser.add_argument('--config-file', action=ParseFromConfigFile,
+                         type=str, help='Path to configuration file')
+    parser.add_argument('--seed', default=None, type=int,
+                        help='Seed for random number generators')
+
     # training
     training = parser.add_argument_group('training setup')
     training.add_argument('--epochs', type=int, required=True,
@@ -81,9 +79,11 @@ def parse_args(parser):
                           help='Number of epochs per checkpoint')
     training.add_argument('--checkpoint-path', type=str, default='',
                           help='Checkpoint path to resume training')
+    training.add_argument('--resume-from-last', action='store_true',
+                          help='Resumes training from the last checkpoint; uses the directory provided with \'--output\' option to search for the checkpoint \"checkpoint_<model_name>_last.pt\"')
     training.add_argument('--dynamic-loss-scaling', type=bool, default=True,
                           help='Enable dynamic loss scaling')
-    training.add_argument('--amp-run', action='store_true',
+    training.add_argument('--amp', action='store_true',
                           help='Enable AMP')
     training.add_argument('--cudnn-enabled', action='store_true',
                           help='Enable cudnn')
@@ -159,8 +159,11 @@ def parse_args(parser):
 
 def reduce_tensor(tensor, num_gpus):
     rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.reduce_op.SUM)
-    rt /= num_gpus
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    if rt.is_floating_point():
+        rt = rt/num_gpus
+    else:
+        rt = torch.div(rt, num_gpus, rounding_mode='floor')
     return rt
 
 
@@ -179,35 +182,78 @@ def init_distributed(args, world_size, rank, group_name):
     print("Done initializing distributed")
 
 
-def save_checkpoint(model, optimizer, epoch, config, amp_run, filepath):
-    print("Saving model and optimizer state at epoch {} to {}".format(
-        epoch, filepath))
-    checkpoint = {'epoch': epoch,
-                  'cuda_rng_state_all': torch.cuda.get_rng_state_all(),
-                  'random_rng_state': torch.random.get_rng_state(),
-                  'config': config,
-                  'state_dict': model.state_dict(),
-                  'optimizer': optimizer.state_dict()}
-    if amp_run:
-        checkpoint['amp'] = amp.state_dict()
+def save_checkpoint(model, optimizer, scaler, epoch, config, output_dir,
+                    model_name, local_rank, world_size):
 
-    torch.save(checkpoint, filepath)
+    random_rng_state = torch.random.get_rng_state().cuda()
+    cuda_rng_state = torch.cuda.get_rng_state(local_rank).cuda()
+
+    random_rng_states_all = [torch.empty_like(random_rng_state) for _ in range(world_size)]
+    cuda_rng_states_all = [torch.empty_like(cuda_rng_state) for _ in range(world_size)]
+
+    if world_size > 1:
+        dist.all_gather(random_rng_states_all, random_rng_state)
+        dist.all_gather(cuda_rng_states_all, cuda_rng_state)
+    else:
+        random_rng_states_all = [random_rng_state]
+        cuda_rng_states_all = [cuda_rng_state]
+
+    random_rng_states_all = torch.stack(random_rng_states_all).cpu()
+    cuda_rng_states_all = torch.stack(cuda_rng_states_all).cpu()
+
+    if local_rank == 0:
+        checkpoint = {'epoch': epoch,
+                      'cuda_rng_state_all': cuda_rng_states_all,
+                      'random_rng_states_all': random_rng_states_all,
+                      'config': config,
+                      'state_dict': model.state_dict(),
+                      'optimizer': optimizer.state_dict(),
+                      'scaler': scaler.state_dict()}
+
+        checkpoint_filename = "checkpoint_{}_{}.pt".format(model_name, epoch)
+        checkpoint_path = os.path.join(output_dir, checkpoint_filename)
+        print("Saving model and optimizer state at epoch {} to {}".format(
+            epoch, checkpoint_path))
+        torch.save(checkpoint, checkpoint_path)
+
+        symlink_src = checkpoint_filename
+        symlink_dst = os.path.join(
+            output_dir, "checkpoint_{}_last.pt".format(model_name))
+        if os.path.exists(symlink_dst) and os.path.islink(symlink_dst):
+            print("Updating symlink", symlink_dst, "to point to", symlink_src)
+            os.remove(symlink_dst)
+
+        os.symlink(symlink_src, symlink_dst)
 
 
-def load_checkpoint(model, optimizer, epoch, config, amp_run, filepath, rank):
+def get_last_checkpoint_filename(output_dir, model_name):
+    symlink = os.path.join(output_dir, "checkpoint_{}_last.pt".format(model_name))
+    if os.path.exists(symlink):
+        print("Loading checkpoint from symlink", symlink)
+        return os.path.join(output_dir, os.readlink(symlink))
+    else:
+        print("No last checkpoint available - starting from epoch 0 ")
+        return ""
+
+
+def load_checkpoint(model, optimizer, scaler, epoch, filepath, local_rank):
 
     checkpoint = torch.load(filepath, map_location='cpu')
 
     epoch[0] = checkpoint['epoch']+1
-    device_id = rank % torch.cuda.device_count()
+    device_id = local_rank % torch.cuda.device_count()
     torch.cuda.set_rng_state(checkpoint['cuda_rng_state_all'][device_id])
-    torch.random.set_rng_state(checkpoint['random_rng_state'])
-    config = checkpoint['config']
+    if 'random_rng_states_all' in checkpoint:
+        torch.random.set_rng_state(checkpoint['random_rng_states_all'][device_id])
+    elif 'random_rng_state' in checkpoint:
+        torch.random.set_rng_state(checkpoint['random_rng_state'])
+    else:
+        raise Exception("Model checkpoint must have either 'random_rng_state' or 'random_rng_states_all' key.")
     model.load_state_dict(checkpoint['state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer'])
+    scaler.load_state_dict(checkpoint['scaler'])
+    return checkpoint['config']
 
-    if amp_run:
-        amp.load_state_dict(checkpoint['amp'])
 
 # adapted from: https://discuss.pytorch.org/t/opinion-eval-should-be-a-context-manager/18998/3
 # Following snippet is licensed under MIT license
@@ -225,14 +271,15 @@ def evaluating(model):
 
 
 def validate(model, criterion, valset, epoch, batch_iter, batch_size,
-             world_size, collate_fn, distributed_run, rank, batch_to_gpu):
+             world_size, collate_fn, distributed_run, perf_bench, batch_to_gpu, amp_run):
     """Handles all the validation scoring and printing"""
     with evaluating(model), torch.no_grad():
         val_sampler = DistributedSampler(valset) if distributed_run else None
         val_loader = DataLoader(valset, num_workers=1, shuffle=False,
                                 sampler=val_sampler,
                                 batch_size=batch_size, pin_memory=False,
-                                collate_fn=collate_fn)
+                                collate_fn=collate_fn,
+                                drop_last=(True if perf_bench else False))
 
         val_loss = 0.0
         num_iters = 0
@@ -242,12 +289,15 @@ def validate(model, criterion, valset, epoch, batch_iter, batch_size,
             iter_start_time = time.perf_counter()
 
             x, y, num_items = batch_to_gpu(batch)
-            y_pred = model(x)
-            loss = criterion(y_pred, y)
+            #AMP upstream autocast
+            with torch.cuda.amp.autocast(enabled=amp_run):
+                y_pred = model(x)
+                loss = criterion(y_pred, y)
+
             if distributed_run:
                 reduced_val_loss = reduce_tensor(loss.data, world_size).item()
                 reduced_num_items = reduce_tensor(num_items.data, 1).item()
-            else:
+            else:               #
                 reduced_val_loss = loss.item()
                 reduced_num_items = num_items.item()
             val_loss += reduced_val_loss
@@ -261,13 +311,15 @@ def validate(model, criterion, valset, epoch, batch_iter, batch_size,
             val_items_per_sec += items_per_sec
             num_iters += 1
 
-        val_loss = val_loss/(i + 1)
+        val_loss = val_loss/num_iters
+        val_items_per_sec = val_items_per_sec/num_iters
+
 
         DLLogger.log(step=(epoch,), data={'val_loss': val_loss})
-        DLLogger.log(step=(epoch,), data={'val_items_per_sec':
-                                         (val_items_per_sec/num_iters if num_iters > 0 else 0.0)})
+        DLLogger.log(step=(epoch,), data={'val_items_per_sec': val_items_per_sec})
 
-        return val_loss
+        return val_loss, val_items_per_sec
+
 
 def adjust_learning_rate(iteration, epoch, optimizer, learning_rate,
                          anneal_steps, anneal_factor, rank):
@@ -305,9 +357,13 @@ def main():
 
     distributed_run = world_size > 1
 
+    if args.seed is not None:
+        torch.manual_seed(args.seed + local_rank)
+        np.random.seed(args.seed + local_rank)
+
     if local_rank == 0:
-        DLLogger.init(backends=[JSONStreamBackend(Verbosity.DEFAULT,
-                                                  args.output+'/'+args.log_file),
+        log_file = os.path.join(args.output, args.log_file)
+        DLLogger.init(backends=[JSONStreamBackend(Verbosity.DEFAULT, log_file),
                                 StdOutBackend(Verbosity.VERBOSE)])
     else:
         DLLogger.init(backends=[])
@@ -316,8 +372,13 @@ def main():
         DLLogger.log(step="PARAMETER", data={k:v})
     DLLogger.log(step="PARAMETER", data={'model_name':'Tacotron2_PyT'})
 
+    DLLogger.metadata('run_time', {'unit': 's'})
+    DLLogger.metadata('val_loss', {'unit': None})
+    DLLogger.metadata('train_items_per_sec', {'unit': 'items/s'})
+    DLLogger.metadata('val_items_per_sec', {'unit': 'items/s'})
+
     model_name = args.model_name
-    parser = models.parse_model_args(model_name, parser)
+    parser = models.model_parser(model_name, parser)
     args, _ = parser.parse_known_args()
 
     torch.backends.cudnn.enabled = args.cudnn_enabled
@@ -334,16 +395,13 @@ def main():
                              cpu_run=False,
                              uniform_initialize_bn_weight=not args.disable_uniform_initialize_bn_weight)
 
-    if not args.amp_run and distributed_run:
-        model = DDP(model)
+    if distributed_run:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate,
                                  weight_decay=args.weight_decay)
 
-    if args.amp_run:
-        model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
-        if distributed_run:
-            model = DDP(model)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     try:
         sigma = args.sigma
@@ -352,9 +410,12 @@ def main():
 
     start_epoch = [0]
 
-    if args.checkpoint_path is not "":
-        load_checkpoint(model, optimizer, start_epoch, model_config,
-                        args.amp_run, args.checkpoint_path, local_rank)
+    if args.resume_from_last:
+        args.checkpoint_path = get_last_checkpoint_filename(args.output, model_name)
+
+    if args.checkpoint_path != "":
+        model_config = load_checkpoint(model, optimizer, scaler, start_epoch,
+                                       args.checkpoint_path, local_rank)
 
     start_epoch = start_epoch[0]
 
@@ -370,7 +431,7 @@ def main():
     trainset = data_functions.get_data_loader(
         model_name, args.dataset_path, args.training_files, args)
     if distributed_run:
-        train_sampler = DistributedSampler(trainset)
+        train_sampler = DistributedSampler(trainset, seed=(args.seed or 0))
         shuffle = False
     else:
         train_sampler = None
@@ -399,14 +460,10 @@ def main():
         # used to calculate avg items/sec over epoch
         reduced_num_items_epoch = 0
 
-        # used to calculate avg loss over epoch
-        train_epoch_avg_loss = 0.0
         train_epoch_items_per_sec = 0.0
 
         num_iters = 0
-
-        # if overflow at the last iteration then do not save checkpoint
-        overflow = False
+        reduced_loss = 0
 
         if distributed_run:
             train_loader.sampler.set_epoch(epoch)
@@ -423,8 +480,10 @@ def main():
             model.zero_grad()
             x, y, num_items = batch_to_gpu(batch)
 
-            y_pred = model(x)
-            loss = criterion(y_pred, y)
+            #AMP upstream autocast
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                y_pred = model(x)
+                loss = criterion(y_pred, y)
 
             if distributed_run:
                 reduced_loss = reduce_tensor(loss.data, world_size).item()
@@ -437,23 +496,25 @@ def main():
 
             DLLogger.log(step=(epoch,i), data={'train_loss': reduced_loss})
 
-            train_epoch_avg_loss += reduced_loss
             num_iters += 1
 
             # accumulate number of items processed in this epoch
             reduced_num_items_epoch += reduced_num_items
 
-            if args.amp_run:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    amp.master_params(optimizer), args.grad_clip_thresh)
+            if args.amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.grad_clip_thresh)
+                scaler.step(optimizer)
+                scaler.update()
             else:
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
+                torch.nn.utils.clip_grad_norm_(
                     model.parameters(), args.grad_clip_thresh)
+                optimizer.step()
 
-            optimizer.step()
+            model.zero_grad(set_to_none=True)
 
             torch.cuda.synchronize()
             iter_stop_time = time.perf_counter()
@@ -471,18 +532,19 @@ def main():
 
         DLLogger.log(step=(epoch,), data={'train_items_per_sec':
                                           (train_epoch_items_per_sec/num_iters if num_iters > 0 else 0.0)})
-        DLLogger.log(step=(epoch,), data={'train_loss': (train_epoch_avg_loss/num_iters if num_iters > 0 else 0.0)})
+        DLLogger.log(step=(epoch,), data={'train_loss': reduced_loss})
         DLLogger.log(step=(epoch,), data={'train_epoch_time': epoch_time})
 
-        val_loss = validate(model, criterion, valset, epoch, iteration,
-                            args.batch_size, world_size, collate_fn,
-                            distributed_run, local_rank, batch_to_gpu)
+        val_loss, val_items_per_sec = validate(model, criterion, valset, epoch,
+                                               iteration, args.batch_size,
+                                               world_size, collate_fn,
+                                               distributed_run, args.bench_class=="perf-train",
+                                               batch_to_gpu,
+                                               args.amp)
 
-        if (epoch % args.epochs_per_checkpoint == 0) and local_rank == 0 and args.bench_class == "":
-            checkpoint_path = os.path.join(
-                args.output, "checkpoint_{}_{}".format(model_name, epoch))
-            save_checkpoint(model, optimizer, epoch, model_config,
-                            args.amp_run, checkpoint_path)
+        if (epoch % args.epochs_per_checkpoint == 0) and (args.bench_class == "" or args.bench_class == "train"):
+            save_checkpoint(model, optimizer, scaler, epoch, model_config,
+                            args.output, args.model_name, local_rank, world_size)
         if local_rank == 0:
             DLLogger.flush()
 
@@ -491,11 +553,14 @@ def main():
     run_time = run_stop_time - run_start_time
     DLLogger.log(step=tuple(), data={'run_time': run_time})
     DLLogger.log(step=tuple(), data={'val_loss': val_loss})
+    DLLogger.log(step=tuple(), data={'train_loss': reduced_loss})
     DLLogger.log(step=tuple(), data={'train_items_per_sec':
                                      (train_epoch_items_per_sec/num_iters if num_iters > 0 else 0.0)})
+    DLLogger.log(step=tuple(), data={'val_items_per_sec': val_items_per_sec})
 
     if local_rank == 0:
         DLLogger.flush()
+
 
 if __name__ == '__main__':
     main()

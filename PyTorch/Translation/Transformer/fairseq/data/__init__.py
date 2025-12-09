@@ -7,7 +7,7 @@
 #
 #-------------------------------------------------------------------------
 #
-# Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -21,10 +21,7 @@
 # limitations under the License.
 
 from .dictionary import Dictionary
-from .fairseq_dataset import FairseqDataset
 from .indexed_dataset import IndexedDataset, IndexedInMemoryDataset, IndexedRawTextDataset  # noqa: F401
-from .language_pair_dataset import LanguagePairDataset
-from .monolingual_dataset import MonolingualDataset
-from .token_block_dataset import TokenBlockDataset
+from .language_pair_dataset import LanguagePairDataset, load_dataset_splits
 
 from .data_utils import EpochBatchIterator

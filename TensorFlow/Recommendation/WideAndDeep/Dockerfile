@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG FROM_IMAGE_NAME=nvcr.io/nvidia/tensorflow:20.03-tf1-py3
+ARG FROM_IMAGE_NAME=nvcr.io/nvidia/tensorflow:20.10-tf1-py3
 
 FROM ${FROM_IMAGE_NAME}
 
 USER root
 
 # Spark dependencies
-ENV APACHE_SPARK_VERSION 2.3.1
+ENV APACHE_SPARK_VERSION 3.1.3
 ENV HADOOP_VERSION 2.7
 
 RUN apt-get -y update && \
@@ -29,7 +29,7 @@ RUN apt-get -y update && \
 
 RUN cd /tmp && \
         wget -q http://archive.apache.org/dist/spark/spark-${APACHE_SPARK_VERSION}/spark-${APACHE_SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz && \
-        echo "DC3A97F3D99791D363E4F70A622B84D6E313BD852F6FDBC777D31EAB44CBC112CEEAA20F7BF835492FB654F48AE57E9969F93D3B0E6EC92076D1C5E1B40B4696 *spark-${APACHE_SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz" | sha512sum -c - && \
+        echo "34b2c6c5698c254181a020f9e0e5d29b3edeb3b99cd7f51105760b29681461e6e1bb0490c09d8b2005b5836f22d74251961939cad010ffc0d8de656d633b976e *spark-${APACHE_SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz" | sha512sum -c - && \
         tar xzf spark-${APACHE_SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz -C /usr/local --owner root --group root --no-same-owner && \
         rm spark-${APACHE_SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz
 RUN cd /usr/local && ln -s spark-${APACHE_SPARK_VERSION}-bin-hadoop${HADOOP_VERSION} spark
@@ -39,10 +39,9 @@ ENV SPARK_HOME /usr/local/spark
 ENV PYTHONPATH $SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-0.10.7-src.zip
 ENV SPARK_OPTS --driver-java-options=-Xms1024M --driver-java-options=-Xmx4096M --driver-java-options=-Dlog4j.logLevel=info
 
-RUN pip install pyspark==2.3.1
-RUN pip install --no-deps tensorflow-transform apache-beam==2.14 tensorflow-metadata==0.14.0 pydot dill
-RUN pip install ipdb
-RUN pip install -e git://github.com/NVIDIA/dllogger#egg=dllogger
+COPY requirements* ./
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-deps -r requirements-no-deps.txt
 
 WORKDIR  /wd
 COPY . .

@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:19.10-py3  
+ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:23.10-py3
 FROM ${FROM_IMAGE_NAME}
 
-
-RUN apt-get update && apt-get install -y libsndfile1 && apt-get install -y sox && rm -rf /var/lib/apt/lists/*
+RUN apt update && apt install -y libsndfile1 && apt install -y sox && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace/jasper
 
 # Install requirements (do this first for better caching)
 COPY requirements.txt .
+RUN if [[ ! -z "$(command -v conda)" ]]; then conda install -y pyyaml==5.4.1; fi
 RUN pip install --disable-pip-version-check -U -r requirements.txt
 
 # Copy rest of files

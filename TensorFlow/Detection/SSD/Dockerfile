@@ -1,13 +1,15 @@
-FROM nvcr.io/nvidia/tensorflow:19.05-py3 as base
+ARG FROM_IMAGE_NAME=nvcr.io/nvidia/tensorflow:20.06-tf1-py3
+FROM ${FROM_IMAGE_NAME}
 
-FROM base as sha
 
-RUN mkdir /sha
-RUN cat `cat HEAD | cut -d' ' -f2` > /sha/repo_sha
-
-FROM base as final
 
 WORKDIR /workdir
+
+RUN export DEBIAN_FRONTEND=noninteractive \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libpmi2-0-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 RUN PROTOC_VERSION=3.0.0 && \
     PROTOC_ZIP=protoc-${PROTOC_VERSION}-linux-x86_64.zip && \
@@ -16,8 +18,8 @@ RUN PROTOC_VERSION=3.0.0 && \
     rm -f $PROTOC_ZIP
 
 COPY requirements.txt .
-RUN pip install Cython
 RUN pip install -r requirements.txt
+RUN pip --no-cache-dir --no-cache install 'git+https://github.com/NVIDIA/dllogger'
 
 WORKDIR models/research/
 COPY models/research/ .
@@ -27,5 +29,3 @@ ENV PYTHONPATH="/workdir/models/research/:/workdir/models/research/slim/:$PYTHON
 COPY examples/ examples
 COPY configs/ configs/
 COPY download_all.sh download_all.sh
-
-COPY --from=sha /sha .

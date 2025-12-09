@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <THC/THC.h>
-#include <THC/THCDeviceUtils.cuh>
 #include <torch/torch.h>
 #include <iostream>
 
@@ -81,9 +80,9 @@ at::Tensor box_iou_cuda(at::Tensor box1, at::Tensor box2){
     dim3 blockDim(blockSize);
     int idxJump = minGridSize * blockSize;
     auto stream = at::cuda::getCurrentCUDAStream();
-    box_iou_cuda_kernel<<<gridDim, blockDim, 0, stream.stream()>>>(box_iou.data<float>(), 
-                                                                  (float4*) box1.data<float>(), 
-                                                                  (float4*) box2.data<float>(), 
+    box_iou_cuda_kernel<<<gridDim, blockDim, 0, stream.stream()>>>(box_iou.data_ptr<float>(), 
+                                                                  (float4*) box1.data_ptr<float>(), 
+                                                                  (float4*) box2.data_ptr<float>(), 
                                                                   M, N, 
                                                                   idxJump);
     return box_iou;

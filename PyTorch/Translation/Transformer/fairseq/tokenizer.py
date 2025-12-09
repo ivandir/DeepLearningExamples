@@ -7,7 +7,7 @@
 #
 #-------------------------------------------------------------------------
 #
-# Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import Counter
 import re
 
@@ -28,7 +29,7 @@ import torch
 
 SPACE_NORMALIZER = re.compile("\s+")
 
-path = 'fairseq/prefixes/nonbreaking_prefix.en'
+path = os.path.join(os.path.dirname(os.path.abspath(__file__)),'prefixes/nonbreaking_prefix.en')
 prefixes ={}
 
 with open(path, 'r') as f:
@@ -139,7 +140,7 @@ def tokenize_en(line):
     line = re.sub(r'\]', r'&#93;', line)
 
     #ensure final line breaks
-    if line[-1] is not '\n':
+    if line[-1] != '\n':
         line += '\n'
 
     return line
@@ -180,7 +181,7 @@ class Tokenizer:
             for line in f:
                 ids = Tokenizer.tokenize(
                     line=line,
-                    dict=dict,
+                    dictionary=dict,
                     tokenize=tokenize,
                     add_if_not_exist=False,
                     consumer=replaced_consumer,
@@ -194,7 +195,7 @@ class Tokenizer:
         return {'nseq': nseq, 'nunk': sum(replaced.values()), 'ntok': ntok, 'replaced': len(replaced)}
 
     @staticmethod
-    def tokenize(line, dict, tokenize=tokenize_line, add_if_not_exist=True,
+    def tokenize(line, dictionary, tokenize=tokenize_line, add_if_not_exist=True,
                  consumer=None, append_eos=True, reverse_order=False, bpe=None):
         line = tokenize(line)
         if bpe:
@@ -207,14 +208,14 @@ class Tokenizer:
 
         for i, word in enumerate(words):
             if add_if_not_exist:
-                idx = dict.add_symbol(word)
+                idx = dictionary.add_symbol(word)
             else:
-                idx = dict.index(word)
+                idx = dictionary.index(word)
             if consumer is not None:
                 consumer(word, idx)
             ids[i] = idx
         if append_eos:
-            ids[nwords] = dict.eos_index
+            ids[nwords] = dictionary.eos_index
         return ids
     
     @staticmethod
@@ -294,6 +295,6 @@ class Tokenizer:
         line = re.sub(r' $', '', line)
 
         #add trailing break
-        line += '\n' if line[-1] is not '\n' else ''
+        line += '\n' if line[-1] != '\n' else ''
 
         return line
